@@ -110,7 +110,8 @@ prompt_ids → ③ 引擎 → 采样出的 token_ids → ④ token_ids → 各�
 
 | 能力 | 旧路径 | 现在 |
 |---|---|---|
-| `/v1/messages`（Anthropic） | 无 | ✅ 原生，含 `message_start`/`content_block_delta`/`message_delta` 事件与 `cache_read_input_tokens` |
+| `/v1/messages`（Anthropic） | 无 | ✅ 原生，含 `message_start`/`content_block_delta`/`message_delta` 事件与 `cache_read_input_tokens`；另加官网同款 `/anthropic` 前缀 |
+| `/v1/messages/count_tokens` | 无 | ✅ 渲染+编码后报 `input_tokens`，与 `usage.input_tokens` 逐位相同 |
 | `/v1/responses`（OpenAI Responses） | 无 | ✅ 原生，含 `output[].content[].output_text` |
 | 思考模式输出切分 | 无（`<think>` 会漏进正文） | ✅ `delta.reasoning_content` + `completion_tokens_details.reasoning_tokens` |
 | 缓存命中 | 手写 `prompt_tokens_details.cached_tokens` | ✅ 三协议各自的字段：`cached_tokens`、`prompt_cache_hit_tokens`/`miss`、`cache_read_input_tokens` |

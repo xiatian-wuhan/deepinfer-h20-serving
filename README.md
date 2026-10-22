@@ -161,8 +161,9 @@ CP8 = 注意力 TP8 + 专家 EP8，8 卡服务同一 batch；DP8 = 8 个独立�
 
 **Base URL** `http://<host>:8888/v1` ｜ **模型名** `DeepSeek-V4.1-Flash-1017`（可用 `DEEPINFER_SERVED_MODEL_NAME` 改）
 
-路由：`/v1/chat/completions`、`/v1/messages`（Anthropic）、`/v1/responses`、`/v1/models`、`/health`、
-`/deepinfer/metrics`。三个协议端点共用同一个引擎和同一套转换/解析实现（见 §6.5）。
+路由：`/v1/chat/completions`、`/v1/messages`（Anthropic，另有 `/anthropic/v1/messages` 这个官网同款前缀）、
+`/v1/messages/count_tokens`、`/v1/responses`、`/v1/models`、`/health`、`/deepinfer/metrics`。
+三个协议端点共用同一个引擎和同一套转换/解析实现（见 §6.5）。
 无鉴权（内网部署），`Authorization` 任意非空值即可。
 
 ```python
@@ -284,6 +285,41 @@ serve/server.sh start --dp 8 --cp 8 --max-num-seqs 32 --port 8888 --protocol-lay
 风险与取舍见 [`notes/25`](notes/25-recipe-protocol-layer.md)。
 
 ---
+
+### 6.6 和 DeepSeek 官网接口的对照
+
+官网（[api-docs.deepseek.com](https://api-docs.deepseek.com/)）当前是四套协议 + 四个配套端点。
+本服务逐项实测如下（✅ 已实测通过，⚠️ 接受但不完全生效，❌ 未实现）：
+
+| 官网能力 | 本服务 | 实测 |
+|---|---|---|
+| Chat Completions `POST /chat/completions` | ✅ `/v1/chat/completions` | 流式/非流式、tools、usage |
+| Responses API `POST /responses` | ✅ `/v1/responses` | `output[].content[].output_text` |
+| Anthropic `base_url=…/anthropic` | ✅ `/anthropic/v1/messages`（`/v1/messages` 同样可用） | 事件流、`cache_read_input_tokens` |
+| `POST /messages/count_tokens` | ✅ `/v1/messages/count_tokens` | 15 == `usage.input_tokens` 15 |
+| 思考模式 `thinking` / `reasoning_effort` | ✅ | `reasoning_content`、`reasoning_tokens` |
+| JSON Output `response_format` | ✅ `json_object` / `json_schema` | 写进 prompt 并约束格式 |
+| Tool Calls + `tool_choice` | ✅ 含 `required`/指定函数 | 非思考模式下 |
+| Chat Prefix Completion（官网在 `/beta`） | ✅ 主端点直接支持 `prefix: true` | 只回续写部分，不回显前缀 |
+| 视觉输入 | ✅ 图片块 | 768×768 → prompt_tokens 393 |
+| Context Caching | ✅ 前缀缓存 | `cached_tokens` / `prompt_cache_hit_tokens` |
+| FIM Completion（`/beta/completions`） | ❌ | checkpoint 有 `<｜fim▁begin｜>` 等 token，但两份参考实现都没有 FIM 模板 |
+| Files API | ❌ | 未实现 |
+| Search & Fetch（服务端联网） | ❌ | 需要搜索后端 |
+| `GET /user/balance`、API Key 鉴权、计费 | ❌ | 内网无鉴权，无计费概念 |
+| `logprobs` / `top_logprobs` | ⚠️ 接受但引擎不产出 | `SamplingParams.logprobs` 在引擎侧是兼容字段 |
+| `n > 1` | ❌ 400 | OpenAI 契约与引擎都只做单条 |
+
+即：**会话类协议四套里三套齐了**（Chat Completions / Responses / Anthropic），
+外加官网要 `/beta` 才有、这里直接在主管线上的 prefix completion 和 JSON Output；
+缺的是 FIM、Files、联网、鉴权和计费——前三个都能做，但都不是"接到模型上"这件事的一部分。
+
+Claude Code 直接按官网的写法接：
+
+```bash
+export ANTHROPIC_BASE_URL=http://<host>:8888/anthropic
+export ANTHROPIC_API_KEY=x      # 无鉴权，随意非空
+```
 
 ## 七、关键修复：Engram fetch 的隐藏开销
 

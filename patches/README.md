@@ -2,7 +2,7 @@
 
 `deepinfer-h20-full.patch` 是**唯一需要应用的补丁**：相对上游
 `DarkraiHL/DeepInfer` 的 `e205d42`（分支 `sm90-hopper`）的完整改动，
-19 文件，+2549 / −1。
+19 文件，+2595 / −1。
 
 ```bash
 git clone https://github.com/DarkraiHL/DeepInfer.git
