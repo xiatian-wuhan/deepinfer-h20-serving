@@ -1001,10 +1001,10 @@ index 0000000..add99d6
 +raise SystemExit(1 if mismatches else 0)
 diff --git a/serve/openai_server.py b/serve/openai_server.py
 new file mode 100644
-index 0000000..d4c5a52
+index 0000000..c9ed329
 --- /dev/null
 +++ b/serve/openai_server.py
-@@ -0,0 +1,771 @@
+@@ -0,0 +1,873 @@
 +"""Minimal OpenAI-compatible chat server on top of the DeepInfer offline engine.
 +
 +DeepInfer ships offline inference only. This wraps one `LLM` per data-parallel rank
@@ -1013,9 +1013,9 @@ index 0000000..d4c5a52
 +
 +    python serve/openai_server.py --model ~/models/DeepSeek-V4.1-Flash-1017 --dp 4 --port 8888
 +
-+Limitations, by design of the open-source engine:
-+- No cross-request prefix cache: every request prefills its full prompt.
-+- Responses are streamed as plain `content`; DSML tool calls are not parsed into `tool_calls`.
++Tool calling: `tools` are rendered into the prompt by the checkpoint's own encoder, and the DSML block
++the model writes back is parsed into OpenAI `tool_calls` (streamed as `delta.tool_calls`) by that same
++reference implementation. Without this the markup reaches the client as plain text.
 +"""
 +
 +from __future__ import annotations
@@ -1167,6 +1167,43 @@ index 0000000..d4c5a52
 +        image_sizes.append((width, height))
 +        total += _image_token_count(width, height, vision)
 +    return {"image_bytes": image_bytes, "image_sizes": image_sizes}, total
++
++class _ToolCallGate:
++    """Withhold the tail of a stream until it is clear whether a DSML tool-call block has started.
++
++    The model writes tool calls as markup in the text stream. Forwarding that verbatim is what made a
++    Claude client print `<|DSML| calls>` instead of running a tool, so the block is buffered and turned into
++    structured `tool_calls` at the end. Only a tail as long as the start marker is ever withheld, so normal
++    streaming is unaffected.
++    """
++
++    def __init__(self, prefix: str) -> None:
++        self.prefix = prefix
++        self.pending = ""
++        self.block = ""
++        self.gated = False
++
++    def feed(self, text: str) -> str:
++        if self.gated:
++            self.block += text
++            return ""
++        self.pending += text
++        pos = self.pending.find(self.prefix)
++        if pos >= 0:
++            out, self.block = self.pending[:pos], self.pending[pos:]
++            self.pending, self.gated = "", True
++            return out
++        keep = len(self.prefix) - 1
++        if len(self.pending) <= keep:
++            return ""
++        out, self.pending = self.pending[:-keep], self.pending[-keep:]
++        return out
++
++    def flush(self) -> str:
++        out = "" if self.gated else self.pending
++        self.pending = ""
++        return out
++
 +
 +def parse_args() -> argparse.Namespace:
 +    p = argparse.ArgumentParser()
@@ -1431,11 +1468,15 @@ index 0000000..d4c5a52
 +        from transformers import AutoTokenizer
 +
 +        sys.path.insert(0, str(Path(args.model) / "encoding"))
-+        from encoding import encode_messages  # the checkpoint's own prompt-format reference
++        # The checkpoint's own prompt-format reference: it both renders `tools` into the prompt and parses
++        # the DSML block the model writes back.
++        from encoding import dsml_token, encode_messages, parse_tool_calls, tool_calls_block_name
 +
 +        self.args = args
 +        self.model_name = args.served_model_name or args.model
 +        self.encode_messages = encode_messages
++        self._parse_tool_calls = parse_tool_calls
++        self.tool_calls_prefix = f"\n\n<{dsml_token}{tool_calls_block_name}"
 +        self.tokenizer = AutoTokenizer.from_pretrained(args.model)
 +        # Vision config drives image-token accounting; absent means the checkpoint is text only.
 +        vision: dict = {}
@@ -1545,6 +1586,31 @@ index 0000000..d4c5a52
 +                parts.insert(1, json.dumps(body["tools"], ensure_ascii=False))
 +            prompt = "".join(parts) + "<｜Assistant｜></think>"
 +        return self.tokenizer.encode(prompt, add_special_tokens=False), multi_modal, image_tokens
++
++    def split_tool_calls(self, text: str) -> tuple[str, list[dict]]:
++        """Strip a trailing DSML tool-call block and return it as OpenAI `tool_calls`.
++
++        Malformed markup (for example a block cut off by max_tokens) is left in the text rather than
++        dropping it or failing the request.
++        """
++        start = text.find(self.tool_calls_prefix)
++        if start < 0:
++            return text, []
++        try:
++            _, _, calls = self._parse_tool_calls(start + len(self.tool_calls_prefix), text)
++        except Exception as exc:  # noqa: BLE001 - keep the raw text instead of erroring
++            if self.args.log_requests:
++                print(f"[tools] DSML parse failed, passing the text through: {exc}", flush=True)
++            return text, []
++        converted = [
++            {
++                "id": f"call_{uuid.uuid4().hex[:24]}",
++                "type": "function",
++                "function": {"name": call["name"], "arguments": call["arguments"]},
++            }
++            for call in calls
++        ]
++        return text[:start].rstrip("\n"), converted
 +
 +    @staticmethod
 +    def affinity_key(body: dict) -> bytes | None:
@@ -1724,12 +1790,43 @@ index 0000000..d4c5a52
 +
 +            async def sse():
 +                done = False
++                gate = _ToolCallGate(fe.tool_calls_prefix)
++                finish_reason = "stop"
 +                try:
 +                    yield chunk({"role": "assistant", "content": ""})
-+                    async for text, finish in tokens():  # noqa: B007  (the last finish reason is reported below)
-+                        if text or finish:
-+                            yield chunk({"content": text} if text else {}, finish)
++                    async for text, finish in tokens():
++                        if finish is not None:
++                            finish_reason = finish
++                        out = gate.feed(text)
++                        if out:
++                            yield chunk({"content": out})
 +                    done = True
++                    tail = gate.flush()
++                    if tail:
++                        yield chunk({"content": tail})
++                    tool_calls: list[dict] = []
++                    if gate.gated:
++                        _, tool_calls = fe.split_tool_calls(gate.block)
++                        if not tool_calls:
++                            # Truncated or malformed block: surface it verbatim instead of dropping it.
++                            yield chunk({"content": gate.block})
++                    for index, call in enumerate(tool_calls):
++                        # Name first, then arguments: what OpenAI clients (and new-api) accumulate.
++                        yield chunk({
++                            "tool_calls": [{
++                                "index": index,
++                                "id": call["id"],
++                                "type": "function",
++                                "function": {"name": call["function"]["name"], "arguments": ""},
++                            }]
++                        })
++                        yield chunk({
++                            "tool_calls": [{"index": index, "function": {"arguments": call["function"]["arguments"]}}]
++                        })
++                    if tool_calls:
++                        finish_reason = "tool_calls"
++                    # finish_reason gets its own chunk now: with tool calls it must come after the deltas.
++                    yield chunk({}, finish_reason)
 +                    if include_usage or fe.args.always_usage:
 +                        # `--always-usage`: gateways that never send include_usage still need the numbers,
 +                        # otherwise they count tokens locally and cache hits always read as zero.
@@ -1749,12 +1846,17 @@ index 0000000..d4c5a52
 +            cached_tokens = fe.cached.get(rid, 0)  # must be read before release() pops it
 +        finally:
 +            fe.release(rid, aborted=not done)
++        content, tool_calls = fe.split_tool_calls("".join(parts))
++        message: dict = {"role": "assistant", "content": content}
++        if tool_calls:
++            message["tool_calls"] = tool_calls
++            finish = "tool_calls"
 +        return {
 +            "id": cid,
 +            "object": "chat.completion",
 +            "created": created,
 +            "model": fe.model_name,
-+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(parts)}, "finish_reason": finish}],
++            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
 +            "usage": usage(cached_tokens),
 +        }
 +

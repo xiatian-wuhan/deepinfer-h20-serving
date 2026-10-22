@@ -48,10 +48,10 @@ fp8 Engram 表分片后 23.4 GB/rank。
 
 ```
 docker/         单 Dockerfile（含 rdma-core 54 构建块）+ 构建脚本
-patches/        deepinfer-h20-full.patch（相对上游 e205d42 的完整改动，19 文件 +1978）
+patches/        deepinfer-h20-full.patch（相对上游 e205d42 的完整改动，19 文件 +2080）
                 pr*.patch（分项补丁，便于阅读）
 tools/          e2e 窗口、服务压测/回归、profiler、GIN/dma-buf 探针
-notes/          01–19 调查记录（依赖基线、布局选型、网关排障）
+notes/          01–20 调查记录（依赖基线、布局选型、网关排障、工具调用）
 manifests/      源码仓库与子模块清单
 ```
 
@@ -93,7 +93,7 @@ DEEPINFER_YOCO_PREFILL_KEEP_TOKENS=140
 ### 3. 验证
 
 ```bash
-python3 tools/serve_test.py        # 18 项 OpenAI 协议断言
+python3 tools/serve_test.py        # 25 项 OpenAI 协议断言
 ```
 
 ---
@@ -193,6 +193,34 @@ client.chat.completions.create(
   需要 URL 时显式加 `--allow-image-urls`；
 - 单图上限 64 MiB / `max_image_tokens=1024` 个 prompt token；解码失败返回 400，绝不静默降级为纯文本。
 
+### 6.4 工具调用
+
+`tools` 按 OpenAI 格式传入即可。请求侧由模型自带的编码器渲染进 prompt，响应侧由**同一个**
+参考实现把模型写出的 DSML 块解析回 `tool_calls`——不解析的话，标记会原样出现在 `content` 里，
+客户端（Claude Code 等）看到的是一段文本而不是工具调用。
+
+```python
+tools = [{"type": "function", "function": {
+    "name": "Bash", "description": "Run a shell command",
+    "parameters": {"type": "object",
+                   "properties": {"command": {"type": "string"}},
+                   "required": ["command"]}}}]
+r = client.chat.completions.create(
+    model="DeepSeek-V4.1-Flash-1017",
+    messages=[{"role": "user", "content": "列出 /tmp"}],
+    tools=tools, max_tokens=300,
+)
+print(r.choices[0].finish_reason)          # tool_calls
+print(r.choices[0].message.tool_calls)     # [{id, type, function:{name, arguments}}]
+```
+
+- 非流式：`finish_reason="tool_calls"`，`message.tool_calls[].function.arguments` 是 JSON 字符串；
+- 流式：按 OpenAI 约定发 `delta.tool_calls`（先 `name` 后 `arguments`），`finish_reason` 单独一个 chunk；
+- `max_tokens` 截断导致块不完整时，原文照发而不是丢弃，便于排查。
+
+Anthropic 客户端（Claude Code）经 new-api 调用的链路已验证：我们返回 `tool_calls`，
+new-api 转成 `content_block_start: tool_use` + `input_json_delta`。
+
 ### 6.3 经网关（new-api / one-api）使用
 
 缓存命中数走标准字段 `usage.prompt_tokens_details.cached_tokens`，new-api 会记进用量日志的
@@ -215,7 +243,8 @@ client.chat.completions.create(
 ### 6.2 参数支持
 
 **生效**：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`seed`、`stream`、
-`stream_options.include_usage`、`tools`（走 chat template）、`prefix_cache`（非标准，默认 true）。
+`stream_options.include_usage`、`tools`（双向：渲染进 prompt，并把模型输出的 DSML 解析成
+`tool_calls`）、`prefix_cache`（非标准，默认 true）。
 
 **未实现（会被忽略）**：`stop`、`stop_token_ids`、`top_k`、`min_tokens`、`n>1`、`logit_bias`、
 `presence_penalty`/`frequency_penalty`、`response_format`、`reasoning_effort`。
@@ -261,10 +290,11 @@ num_tokens=24    max=32768   ← 解码每一步
 
 | 项目 | 结果 |
 |---|---|
-| OpenAI 协议回归（`tools/serve_test.py`） | **18 passed, 0 failed** |
+| OpenAI 协议回归（`tools/serve_test.py`） | **25 passed, 0 failed** |
 | 非流式 / 流式 SSE / usage / cached_tokens | 全部通过 |
 | 前缀缓存 | 同 prompt 二次请求 `cached_tokens=3840/4019` |
 | 图片输入 | 单图、双图、流式、Anthropic 块、URL 拒绝，全部通过 |
+| 工具调用 | 非流式/流式均返回 `tool_calls`，无 DSML 泄漏 |
 | Engram fetch 正确性（2 卡） | 3 组情形逐字节一致 |
 | 图片 token 数学 | 410 个尺寸与引擎 `compute_image_layout` 比对，**0 处不一致** |
 
@@ -291,7 +321,7 @@ cd DeepInfer && git checkout e205d42e4b28185e50ce30f6b7204cd01e59974c
 git apply /path/to/patches/deepinfer-h20-full.patch
 ```
 
-补丁内容（19 文件，+1978/−1）包含：SM90 支持、前缀缓存（PR#144）、scheduler API（PR#195）、
+补丁内容（19 文件，+2080/−1）包含：SM90 支持、前缀缓存（PR#144）、scheduler API（PR#195）、
 OpenAI 服务层（PR#147）、NVLink Engram fetch（PR#99），以及本仓库的 Engram 优化、
 `--cp` 透传、图片输入。分项补丁见 `patches/pr*.patch`。
 
@@ -301,7 +331,8 @@ OpenAI 服务层（PR#147）、NVLink Engram fetch（PR#99），以及本仓库�
 
 - DeepInfer: <https://github.com/DarkraiHL/DeepInfer>
 - 上游方法论：`doc/sm90.md`、`doc/inference_deployment_qa.md`
-- 本仓库调查记录：`notes/01`–`notes/19`，其中
+- 本仓库调查记录：`notes/01`–`notes/20`，其中
   [`notes/17`](notes/17-engram-fetch-fix.md)（Engram 修复）与
   [`notes/18`](notes/18-cp8-for-1m.md)（1M 布局选型）、
-  [`notes/19`](notes/19-cache-usage-through-gateway.md)（网关下的缓存显示排查）是核心。
+  [`notes/19`](notes/19-cache-usage-through-gateway.md)（网关下的缓存显示排查）、
+  [`notes/20`](notes/20-tool-calls-dsml.md)（工具调用解析）是核心。

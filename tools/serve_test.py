@@ -120,5 +120,48 @@ else:
         _rejected = exc.code == 400
     check("默认拒绝外部图片 URL（SSRF 防护）", _rejected)
 
+print("\n=== 7) 工具调用（DSML -> OpenAI tool_calls）===")
+_TOOLS = [{"type": "function", "function": {"name": "Bash", "description": "Run a shell command",
+    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]
+_ASK = [{"role": "user", "content": "用 Bash 工具列出 /tmp 目录，只调用工具。"}]
+_r = json.loads(post({"model": MODEL, "max_tokens": 300, "temperature": 0,
+                      "messages": _ASK, "tools": _TOOLS}).read())
+_c = _r["choices"][0]
+_tc = _c["message"].get("tool_calls") or []
+check("非流式返回 tool_calls", len(_tc) == 1 and _tc[0]["function"]["name"] == "Bash", str(len(_tc)))
+check("finish_reason 为 tool_calls", _c["finish_reason"] == "tool_calls", _c["finish_reason"])
+try:
+    _args = json.loads(_tc[0]["function"]["arguments"]) if _tc else {}
+except json.JSONDecodeError:
+    _args = {}
+check("arguments 是合法 JSON 且含 command", "command" in _args, str(_args)[:80])
+check("DSML 未泄漏到 content", "<\uff5cDSML\uff5c" not in (_c["message"].get("content") or ""))
+
+# Streaming: accumulate delta.tool_calls the way an OpenAI client does.
+_req = urllib.request.Request(BASE + "/v1/chat/completions",
+    data=json.dumps({"model": MODEL, "max_tokens": 300, "temperature": 0, "stream": True,
+                     "messages": _ASK, "tools": _TOOLS}).encode(),
+    headers={"Content-Type": "application/json"})
+_sfin, _scalls, _leak = None, {}, False
+with urllib.request.urlopen(_req, timeout=300) as _resp:
+    for _line in _resp:
+        _line = _line.decode().strip()
+        if not _line.startswith("data: {"):
+            continue
+        _o = json.loads(_line[6:])
+        for _ch in _o.get("choices") or []:
+            if _ch.get("finish_reason"):
+                _sfin = _ch["finish_reason"]
+            if "\uff5cDSML\uff5c" in ((_ch.get("delta") or {}).get("content") or ""):
+                _leak = True
+            for _d in (_ch.get("delta") or {}).get("tool_calls") or []:
+                _e = _scalls.setdefault(_d["index"], {"name": "", "args": ""})
+                _f = _d.get("function") or {}
+                _e["name"] += _f.get("name") or ""
+                _e["args"] += _f.get("arguments") or ""
+check("流式返回 delta.tool_calls", len(_scalls) == 1 and _scalls[0]["name"] == "Bash", str(list(_scalls)))
+check("流式 finish_reason 为 tool_calls", _sfin == "tool_calls", str(_sfin))
+check("流式 DSML 未泄漏", not _leak)
+
 print(f"\n===== 结果: {ok} passed, {fail} failed =====")
 sys.exit(1 if fail else 0)
