@@ -1001,10 +1001,10 @@ index 0000000..add99d6
 +raise SystemExit(1 if mismatches else 0)
 diff --git a/serve/openai_server.py b/serve/openai_server.py
 new file mode 100644
-index 0000000..c9ed329
+index 0000000..5ca1fc1
 --- /dev/null
 +++ b/serve/openai_server.py
-@@ -0,0 +1,873 @@
+@@ -0,0 +1,1005 @@
 +"""Minimal OpenAI-compatible chat server on top of the DeepInfer offline engine.
 +
 +DeepInfer ships offline inference only. This wraps one `LLM` per data-parallel rank
@@ -1173,30 +1173,45 @@ index 0000000..c9ed329
 +
 +    The model writes tool calls as markup in the text stream. Forwarding that verbatim is what made a
 +    Claude client print `<|DSML| calls>` instead of running a tool, so the block is buffered and turned into
-+    structured `tool_calls` at the end. Only a tail as long as the start marker is ever withheld, so normal
++    structured `tool_calls` at the end. Only a tail as long as the block marker is ever withheld, so normal
 +    streaming is unaffected.
++
++    The marker is `<|DSML|` on its own, not `\\n\\n<|DSML| calls`: the checkpoint's streaming parser matches
++    `NewlinesAndMarker` (zero or more newlines, then the marker) while the offline splitter asserts the exact
++    `\\n\\n` layout it was trained on. A turn that starts with a tool call, or one wrapped in a single
++    newline, is well formed for the model but would otherwise leak raw markup to the client.
 +    """
 +
-+    def __init__(self, prefix: str) -> None:
-+        self.prefix = prefix
++    def __init__(self, marker: str) -> None:
++        self.marker = marker
 +        self.pending = ""
 +        self.block = ""
 +        self.gated = False
++
++    def _withheld(self, text: str) -> int:
++        """Bytes to keep back: enough of a partial marker to decide on the next feed, plus the
++        newline run directly in front of it (the block's lead-in, which `split_tool_calls` strips
++        from the content)."""
++        j = max(0, len(text) - (len(self.marker) - 1))
++        while j > 0 and text[j - 1] == "\n":
++            j -= 1
++        return len(text) - j
 +
 +    def feed(self, text: str) -> str:
 +        if self.gated:
 +            self.block += text
 +            return ""
 +        self.pending += text
-+        pos = self.pending.find(self.prefix)
++        pos = self.pending.find(self.marker)
 +        if pos >= 0:
-+            out, self.block = self.pending[:pos], self.pending[pos:]
++            # The newlines in front of the marker belong to the block, not to the content.
++            out, self.block = self.pending[:pos].rstrip("\n"), self.pending[pos:]
 +            self.pending, self.gated = "", True
 +            return out
-+        keep = len(self.prefix) - 1
-+        if len(self.pending) <= keep:
++        held = self._withheld(self.pending)
++        if len(self.pending) <= held:
 +            return ""
-+        out, self.pending = self.pending[:-keep], self.pending[-keep:]
++        out, self.pending = self.pending[:-held], self.pending[-held:]
 +        return out
 +
 +    def flush(self) -> str:
@@ -1470,13 +1485,22 @@ index 0000000..c9ed329
 +        sys.path.insert(0, str(Path(args.model) / "encoding"))
 +        # The checkpoint's own prompt-format reference: it both renders `tools` into the prompt and parses
 +        # the DSML block the model writes back.
-+        from encoding import dsml_token, encode_messages, parse_tool_calls, tool_calls_block_name
++        from encoding import (
++            decode_dsml_to_arguments,
++            dsml_token,
++            encode_messages,
++            parse_tool_calls,
++            tool_calls_block_name,
++        )
 +
 +        self.args = args
 +        self.model_name = args.served_model_name or args.model
 +        self.encode_messages = encode_messages
 +        self._parse_tool_calls = parse_tool_calls
-+        self.tool_calls_prefix = f"\n\n<{dsml_token}{tool_calls_block_name}"
++        self._decode_dsml_to_arguments = decode_dsml_to_arguments
++        self.dsml_token = dsml_token
++        self.tool_calls_marker = f"<{dsml_token}"
++        self.tool_calls_open = f"<{dsml_token}{tool_calls_block_name}"
 +        self.tokenizer = AutoTokenizer.from_pretrained(args.model)
 +        # Vision config drives image-token accounting; absent means the checkpoint is text only.
 +        vision: dict = {}
@@ -1555,6 +1579,8 @@ index 0000000..c9ed329
 +            if not messages or messages[0].get("role") != "system":
 +                messages.insert(0, {"role": "system", "content": ""})
 +            messages[0]["tools"] = body["tools"]
++        if self.args.log_requests:
++            self._log_message_order(messages)
 +        has_images = _messages_have_images(messages)
 +        if has_images and not self.has_vision:
 +            raise ValueError("this checkpoint has no vision encoder; image input is not supported")
@@ -1568,6 +1594,8 @@ index 0000000..c9ed329
 +            multi_modal, image_tokens = _resolve_images(
 +                media.get("images") or [], self.vision, self.args.allow_image_urls
 +            )
++            if self.args.log_requests:
++                self._log_prompt_order(prompt)
 +        except Exception as exc:  # noqa: BLE001 - the reference encoder rejects some traces
 +            # Never degrade an image request to a text-only prompt: that silently drops the image.
 +            if has_images:
@@ -1587,21 +1615,66 @@ index 0000000..c9ed329
 +            prompt = "".join(parts) + "<｜Assistant｜></think>"
 +        return self.tokenizer.encode(prompt, add_special_tokens=False), multi_modal, image_tokens
 +
++    def _log_message_order(self, messages: list[dict]) -> None:
++        """Compact transcript digest: role order, content sizes, tool-call ids.
++
++        A gateway that reorders history is otherwise invisible from here - the model just answers the
++        wrong turn - so this prints what actually arrived, in order.
++        """
++        parts = []
++        for m in messages:
++            role = m.get("role", "?")
++            content = m.get("content")
++            size = len(content) if isinstance(content, str) else (len(json.dumps(content)) if content else 0)
++            tag = f"{role}:{size}"
++            calls = m.get("tool_calls") or []
++            if calls:
++                tag += "(" + ",".join(str(c.get("id", "?")) for c in calls) + ")"
++            if m.get("tool_call_id"):
++                tag += f"->{m['tool_call_id']}"
++            parts.append(tag)
++        print(f"[msgs] in={' | '.join(parts)}", flush=True)
++
++    def _log_prompt_order(self, prompt: str) -> None:
++        """Speaker tags in the order the model will read them."""
++        seq, i = [], 0
++        while True:
++            user_at = prompt.find("<｜User｜>", i)
++            asst_at = prompt.find("<｜Assistant｜>", i)
++            if user_at < 0 and asst_at < 0:
++                break
++            if user_at >= 0 and (asst_at < 0 or user_at < asst_at):
++                seq.append("U")
++                i = user_at + 1
++            else:
++                seq.append("A")
++                i = asst_at + 1
++        print(f"[msgs] out={''.join(seq)}", flush=True)
++
 +    def split_tool_calls(self, text: str) -> tuple[str, list[dict]]:
 +        """Strip a trailing DSML tool-call block and return it as OpenAI `tool_calls`.
 +
 +        Malformed markup (for example a block cut off by max_tokens) is left in the text rather than
 +        dropping it or failing the request.
 +        """
-+        start = text.find(self.tool_calls_prefix)
++        start = text.find(self.tool_calls_marker)
++        while start >= 0 and not text.startswith(self.tool_calls_open, start):
++            start = text.find(self.tool_calls_marker, start + 1)
 +        if start < 0:
 +            return text, []
++        block = text[start:]
++        calls: list[dict] | None = None
 +        try:
-+            _, _, calls = self._parse_tool_calls(start + len(self.tool_calls_prefix), text)
-+        except Exception as exc:  # noqa: BLE001 - keep the raw text instead of erroring
-+            if self.args.log_requests:
++            _, _, calls = self._parse_tool_calls(len(self.tool_calls_open), block)
++        except Exception as exc:  # noqa: BLE001 - the reference splitter asserts an exact layout
++            calls = self.tolerant_tool_calls(block)
++            if calls is None and self.args.log_requests:
 +                print(f"[tools] DSML parse failed, passing the text through: {exc}", flush=True)
++        if calls is None:
 +            return text, []
++        content = text[:start].rstrip("\n")
++        if not calls:
++            return content, []
 +        converted = [
 +            {
 +                "id": f"call_{uuid.uuid4().hex[:24]}",
@@ -1610,7 +1683,66 @@ index 0000000..c9ed329
 +            }
 +            for call in calls
 +        ]
-+        return text[:start].rstrip("\n"), converted
++        return content, converted
++
++    def tolerant_tool_calls(self, block: str) -> list[dict] | None:
++        """Second chance for a block the reference splitter rejects on layout.
++
++        `encoding.parse_tool_calls` asserts the exact `>\\n` shape the model is trained to emit and raises on
++        anything else; the checkpoint's streaming parser (deepseek-recipe `output_parser.rs`) instead matches
++        `invoke name="` / `parameter name=` literally and skips whatever whitespace sits between them
++        (`Stage::ToolCalls => ActionOnUnmatched::Skip`). Mirroring that here keeps a near-miss readable as a
++        tool call instead of leaking the raw markup into `content`. Returns None when the block really is not
++        parseable (truncated, or a foreign tag).
++        """
++        d = self.dsml_token
++        invoke_open = f'<{d} invoke name="'
++        invoke_close = f"</{d} invoke>"
++        param_open = f'<{d} parameter name="'
++        param_close = f"</{d} parameter>"
++        calls: list[dict] = []
++        cursor = 0
++        while True:
++            at = block.find(invoke_open, cursor)
++            if at < 0:
++                return calls
++            name_start = at + len(invoke_open)
++            name_end = block.find('"', name_start)
++            if name_end < 0:
++                return None
++            name = block[name_start:name_end]
++            args: dict[str, tuple[str, str]] = {}
++            cursor = name_end
++            while True:
++                param_at = block.find(param_open, cursor)
++                end_at = block.find(invoke_close, cursor)
++                if end_at < 0:
++                    return None
++                if param_at < 0 or param_at > end_at:
++                    cursor = end_at + len(invoke_close)
++                    break
++                key_start = param_at + len(param_open)
++                key_end = block.find('"', key_start)
++                if key_end < 0:
++                    return None
++                key = block[key_start:key_end]
++                after_key = key_end + 1  # step over the closing quote of the parameter name
++                flag_prefix = ' string="'
++                if not block.startswith(flag_prefix, after_key):
++                    return None
++                flag_start = after_key + len(flag_prefix)
++                flag_end = block.find('"', flag_start)
++                if flag_end < 0 or block[flag_start:flag_end] not in ("true", "false"):
++                    return None
++                if not block.startswith(">", flag_end + 1):
++                    return None
++                value_start = flag_end + 2
++                value_end = block.find(param_close, value_start)
++                if value_end < 0:
++                    return None
++                args[key] = (block[value_start:value_end], block[flag_start:flag_end])
++                cursor = value_end + len(param_close)
++            calls.append(self._decode_dsml_to_arguments(name, args))
 +
 +    @staticmethod
 +    def affinity_key(body: dict) -> bytes | None:
@@ -1790,7 +1922,7 @@ index 0000000..c9ed329
 +
 +            async def sse():
 +                done = False
-+                gate = _ToolCallGate(fe.tool_calls_prefix)
++                gate = _ToolCallGate(fe.tool_calls_marker)
 +                finish_reason = "stop"
 +                try:
 +                    yield chunk({"role": "assistant", "content": ""})

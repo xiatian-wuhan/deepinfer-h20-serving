@@ -18,6 +18,7 @@ DeepInfer 源码不在此仓库内，用 `patches/deepinfer-h20-full.patch` 打�
 | 1M 是显存问题吗？ | 不是。实测 KV **891 B/token**，1M ≈ **0.87 GiB/rank** |
 | 单会话解码差在哪？ | Engram fetch 的 padding/copy 冗余，已修复：CP8 **240.6–279.1 tok/s**，DP8 **151.9**（上游参考 158） |
 | 高并发谁更好？ | c=32 时 DP8 吞吐 **2380.6** vs CP8 1777.1；但只要承诺 1M 上下文就只能用 CP8 |
+| 消息顺序会不会乱？ | 不会。请求侧 prompt 与官方编码器**逐 token 相同**，跨轮前缀不变；本轮修掉一处 DSML 探测过严（[`notes/24`](notes/24-message-order-vs-official-encoding.md)） |
 
 **建议**：1M 上下文 + 并发 ≤32 的场景选 CP8。低于 ~8 并发 CP8 全面更优；
 DP8 只在纯高吞吐（c≥32 短上下文）时领先，但它交付不了 1M。
@@ -51,7 +52,7 @@ docker/         单 Dockerfile（含 rdma-core 54 构建块）+ 构建脚本
 patches/        deepinfer-h20-full.patch（相对上游 e205d42 的完整改动，19 文件 +2080）
                 pr*.patch（分项补丁，便于阅读）
 tools/          e2e 窗口、服务压测/回归、profiler、GIN/dma-buf 探针
-notes/          01–23 调查记录（依赖基线、布局选型、网关排障、工具调用、驱动/GIN）
+notes/          01–24 调查记录（依赖基线、布局选型、网关排障、工具调用、消息顺序、驱动/GIN）
 manifests/      源码仓库与子模块清单
 ```
 
@@ -219,7 +220,10 @@ print(r.choices[0].message.tool_calls)     # [{id, type, function:{name, argumen
 
 - 非流式：`finish_reason="tool_calls"`，`message.tool_calls[].function.arguments` 是 JSON 字符串；
 - 流式：按 OpenAI 约定发 `delta.tool_calls`（先 `name` 后 `arguments`），`finish_reason` 单独一个 chunk；
-- `max_tokens` 截断导致块不完整时，原文照发而不是丢弃，便于排查。
+- `max_tokens` 截断导致块不完整时，原文照发而不是丢弃，便于排查；
+- 块的识别按官方解析器的口径（`NewlinesAndMarker`：**任意个换行、含 0 个**，再加 `<｜DSML｜`），
+  标签之间多一个空格也认——比"只认 `\n\n` 开头"更鲁棒，见
+  [`notes/24`](notes/24-message-order-vs-official-encoding.md)。
 
 Anthropic 客户端（Claude Code）经 new-api 调用的链路已验证：我们返回 `tool_calls`，
 new-api 转成 `content_block_start: tool_use` + `input_json_delta`。
@@ -334,9 +338,12 @@ OpenAI 服务层（PR#147）、NVLink Engram fetch（PR#99），以及本仓库�
 
 - DeepInfer: <https://github.com/DarkraiHL/DeepInfer>
 - 上游方法论：`doc/sm90.md`、`doc/inference_deployment_qa.md`
-- 本仓库调查记录：`notes/01`–`notes/23`，其中
+- 本仓库调查记录：`notes/01`–`notes/24`，其中
   [`notes/17`](notes/17-engram-fetch-fix.md)（Engram 修复）与
   [`notes/18`](notes/18-cp8-for-1m.md)（1M 布局选型）、
   [`notes/19`](notes/19-cache-usage-through-gateway.md)（网关下的缓存显示排查）、
   [`notes/20`](notes/20-tool-calls-dsml.md)（工具调用解析）、
-  [`notes/23`](notes/23-driver-swap-gin.md)（换开源模块修好 GIN）是核心。
+  [`notes/23`](notes/23-driver-swap-gin.md)（换开源模块修好 GIN）、
+  [`notes/24`](notes/24-message-order-vs-official-encoding.md)（消息顺序与官方实现对表）是核心。
+- DeepSeek 官方协议框架：<https://github.com/deepseek-ai/deepseek-recipe>（Claude/OpenAI/Responses
+  三协议互转 + 流式解码；`notes/24` 用它作为 prompt 渲染与输出解析的对照实现）
