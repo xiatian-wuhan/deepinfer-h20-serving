@@ -1,0 +1,225 @@
+diff --git a/deepinfer/environ.py b/deepinfer/environ.py
+index 332064a0..3e370965 100644
+--- a/deepinfer/environ.py
++++ b/deepinfer/environ.py
+@@ -145,6 +145,8 @@ def DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE(v: str | None) -> float | tuple
+     # -- Model Loading --
+     DEEPINFER_ENGRAM_PAD_TOKEN = EnvVar.int(default=2)
+     DEEPINFER_ENGRAM_FORCE_GPU_STORAGE = EnvVar(lambda v: _bool(v) or envs.DEEPINFER_ACCELERATOR == "ascend")
++    # Fetch Engram over NCCL collectives (single node, no GIN/RDMA); defaults on with EP_DISABLE_GIN=1
++    DEEPINFER_ENGRAM_NVLINK_FETCH = EnvVar(lambda v: _bool(v, os.environ.get("EP_DISABLE_GIN", "0")))
+ 
+     # -- Sampling --
+     DEEPINFER_SAMPLER_FORCE_TOPK = EnvVar.int()
+diff --git a/deepinfer/model_executor/models/v4_modules/engram.py b/deepinfer/model_executor/models/v4_modules/engram.py
+index 123f2acf..7ae41575 100644
+--- a/deepinfer/model_executor/models/v4_modules/engram.py
++++ b/deepinfer/model_executor/models/v4_modules/engram.py
+@@ -205,7 +205,9 @@ def cuda_view_for_write(p: torch.Tensor) -> torch.Tensor:
+         embeddings = [layer.ngram_embedding for layer in self._layers]
+         if self._buffer is None:
+             self._buffer = self.allocate(embeddings)
+-        weights = [cuda_view_for_write(embedding.weight) for embedding in embeddings]
++        # The NVLink buffer keeps host shards itself and needs the CPU tensors, not views of them
++        keep_cpu = envs.DEEPINFER_ENGRAM_NVLINK_FETCH
++        weights = [embedding.weight if keep_cpu else cuda_view_for_write(embedding.weight) for embedding in embeddings]
+         sfs = [embedding.gather_sf() for embedding in embeddings] if embeddings[0].sf is not None else None
+         self._buffer.write(weights, sfs=sfs)
+         for embedding in embeddings:
+diff --git a/deepinfer/model_executor/parallel_utils/engram_nvlink.py b/deepinfer/model_executor/parallel_utils/engram_nvlink.py
+new file mode 100644
+index 00000000..6e39a3de
+--- /dev/null
++++ b/deepinfer/model_executor/parallel_utils/engram_nvlink.py
+@@ -0,0 +1,108 @@
++"""Single-node Engram fetch over NCCL collectives (NVLink), for machines without NCCL GIN.
++
++Drop-in for the `deep_ep.EngramBuffer` subset used by `EngramRuntime` (write / fetch / destroy).
++Each rank keeps its table shard (pinned host memory unless DEEPINFER_ENGRAM_FORCE_GPU_STORAGE) and the
++full FP8 scaling-factor table on GPU. A fetch all-gathers the indices, every rank looks up the rows it
++owns, and one all_to_all returns them; buffers are padded to `max_num_tokens` so no host sync is needed.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++
++import torch
++import torch.distributed as dist
++
++from deepinfer import envs
++
++_NUM_ALIGNED_SF_PACKS = 4  # DeepEP kNumAlignedSFPacks = 16 / sizeof(int32)
++
++
++def _uva_view(t: torch.Tensor) -> torch.Tensor:
++    """CUDA-tagged view of a pinned host tensor (zero-copy reads over PCIe)."""
++    device = torch.device("cuda", torch.cuda.current_device())
++    storage = torch._C._construct_storage_from_data_pointer(t.data_ptr(), device, t.nbytes)
++    return torch.empty(0, dtype=t.dtype, device=device).set_(storage, 0, t.shape, t.stride())
++
++
++class NVLinkEngramBuffer:
++    def __init__(
++        self,
++        group: dist.ProcessGroup,
++        num_entries_per_layer: list[int],
++        hidden: int,
++        max_num_tokens: int,
++        num_entries_per_token: int,
++        dtype: torch.dtype,
++        num_sf_packs: int = 0,
++    ) -> None:
++        self.group = group
++        self.rank, self.world_size = group.rank(), group.size()
++        self.num_entries_per_layer = num_entries_per_layer
++        self.hidden = hidden
++        self.max_num_tokens = max_num_tokens
++        self.num_entries_per_token = num_entries_per_token
++        self.dtype = dtype
++        self.num_sf_packs = num_sf_packs
++
++        num_layers, row_bytes = len(num_entries_per_layer), hidden * dtype.itemsize
++        shape = (self.world_size, num_layers, max_num_tokens, num_entries_per_token)
++        self._gathered_indices = torch.empty(shape, dtype=torch.int32, device="cuda")
++        self._send = torch.empty((*shape, row_bytes), dtype=torch.uint8, device="cuda")
++        self._recv = torch.empty_like(self._send)
++        self._storages: list[torch.Tensor] = []  # keeps the host shards alive
++        self._tables: list[torch.Tensor] = []  # CUDA views used for lookup
++        self._sfs: list[torch.Tensor] | None = None
++
++    def write(self, storages: list[torch.Tensor], sfs: list[torch.Tensor] | None = None) -> None:
++        assert len(storages) == len(self.num_entries_per_layer)
++        for storage, num_entries in zip(storages, self.num_entries_per_layer, strict=True):
++            assert storage.shape == (num_entries, self.hidden) and storage.dtype == self.dtype, (storage.shape, storage.dtype)
++            if envs.DEEPINFER_ENGRAM_FORCE_GPU_STORAGE:
++                storage = storage.to("cuda", non_blocking=True)
++            elif storage.device.type == "cpu" and not storage.is_pinned():
++                storage = storage.pin_memory()
++            self._storages.append(storage)
++            self._tables.append(_uva_view(storage) if storage.device.type == "cpu" else storage)
++        if sfs is not None:
++            self._sfs = [sf.cuda() for sf in sfs]
++        dist.barrier(group=self.group)
++
++    def fetch(self, indices: torch.Tensor, num_qps: int = 0, use_tma_aligned_col_major_sf: bool = True) -> list[Callable]:
++        num_layers, num_tokens, num_entries_per_token = indices.shape
++        assert num_tokens <= self.max_num_tokens and num_entries_per_token == self.num_entries_per_token
++        padded = indices.new_full((num_layers, self.max_num_tokens, num_entries_per_token), -1)
++        padded[:, :num_tokens] = indices
++        dist.all_gather_into_tensor(self._gathered_indices, padded, group=self.group)
++
++        # Look up the requested rows this rank owns; rows owned elsewhere are sent as zeros
++        for layer_idx, (table, num_entries) in enumerate(zip(self._tables, self.num_entries_per_layer, strict=True)):
++            local_idx = self._gathered_indices[:, layer_idx] - self.rank * num_entries
++            owned = (local_idx >= 0) & (local_idx < num_entries)
++            rows = table.index_select(0, torch.where(owned, local_idx, 0).flatten()).view(torch.uint8)
++            send = self._send[:, layer_idx]
++            send.copy_(rows.view(send.shape))
++            send.masked_fill_(~owned.unsqueeze(-1), 0)
++        dist.all_to_all_single(self._recv, self._send, group=self.group)
++
++        token_idx = torch.arange(num_tokens, device=indices.device).unsqueeze(-1)
++        entry_idx = torch.arange(num_entries_per_token, device=indices.device)
++        hooks = []
++        for layer_idx, num_entries in enumerate(self.num_entries_per_layer):
++            owner = (indices[layer_idx] // num_entries).long()
++            fetched = self._recv[owner, layer_idx, token_idx, entry_idx]  # [T, E, row_bytes]
++            fetched = fetched.view(self.dtype).reshape(num_tokens, num_entries_per_token * self.hidden)
++            if self._sfs is None:
++                hooks.append(lambda fetched=fetched: fetched)
++                continue
++            sf = self._sfs[layer_idx][indices[layer_idx].long()].reshape(num_tokens, -1)  # [T, E * packs]
++            if use_tma_aligned_col_major_sf:
++                aligned = (num_tokens + _NUM_ALIGNED_SF_PACKS - 1) // _NUM_ALIGNED_SF_PACKS * _NUM_ALIGNED_SF_PACKS
++                sf = sf.new_empty(sf.size(1) * aligned).as_strided(sf.shape, (1, aligned)).copy_(sf)
++            hooks.append(lambda fetched=fetched, sf=sf: (fetched, sf))
++        return hooks
++
++    def destroy(self) -> None:
++        self._storages.clear()
++        self._tables.clear()
++        self._sfs = None
+diff --git a/deepinfer/model_executor/parallel_utils/userbuffer.py b/deepinfer/model_executor/parallel_utils/userbuffer.py
+index 3dcffd8c..d098a1ab 100644
+--- a/deepinfer/model_executor/parallel_utils/userbuffer.py
++++ b/deepinfer/model_executor/parallel_utils/userbuffer.py
+@@ -135,6 +135,16 @@ def allocate_engram(
+         num_sf_packs: int = 0,
+     ) -> EngramBuffer:
+         assert self.engram is None, "allocate_engram can only be called once"
++        if envs.DEEPINFER_ENGRAM_NVLINK_FETCH:
++            from deepinfer.model_executor.parallel_utils.engram_nvlink import NVLinkEngramBuffer
++
++            self.engram = NVLinkEngramBuffer(
++                engram_group, num_entries_per_layer, hidden_size, max_num_tokens, num_entries_per_token, dtype, num_sf_packs
++            )
++            logger.info(
++                f"Created NVLink EngramBuffer ({len(num_entries_per_layer)} layers, Engram {engram_group.rank()}/{engram_group.size()})"
++            )
++            return self.engram
+         num_gpu_bytes, num_rdma_storage_size = EngramBuffer.get_storage_size_hint(
+             engram_group,
+             num_entries_per_layer,
+diff --git a/tests/distributed/test_engram_nvlink.py b/tests/distributed/test_engram_nvlink.py
+new file mode 100644
+index 00000000..03e0baa8
+--- /dev/null
++++ b/tests/distributed/test_engram_nvlink.py
+@@ -0,0 +1,56 @@
++import pytest
++import torch
++import torch.distributed as dist
++import torch.multiprocessing
++
++from deepinfer.model_executor.parallel_utils.engram_nvlink import NVLinkEngramBuffer
++from deepinfer.utils import get_open_port
++
++WORLD_SIZE = 2
++NUM_ENTRIES_PER_LAYER = (1000, 1004)
++HIDDEN, NUM_ENTRIES_PER_TOKEN, NUM_SF_PACKS, MAX_NUM_TOKENS = 256, 24, 2, 64
++
++
++def _run_fetch(rank: int, port: str) -> None:
++    torch.cuda.set_device(rank)
++    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=WORLD_SIZE)
++
++    # Every rank builds the same full tables, then keeps only its shard
++    g = torch.Generator().manual_seed(0)
++    tables = [
++        torch.randint(0, 256, (WORLD_SIZE * n, HIDDEN), dtype=torch.uint8, generator=g).view(torch.float8_e4m3fn)
++        for n in NUM_ENTRIES_PER_LAYER
++    ]
++    sfs = [
++        torch.randint(-(2**31), 2**31 - 1, (WORLD_SIZE * n, NUM_SF_PACKS), dtype=torch.int32, generator=g) for n in NUM_ENTRIES_PER_LAYER
++    ]
++    buffer = NVLinkEngramBuffer(
++        dist.group.WORLD, list(NUM_ENTRIES_PER_LAYER), HIDDEN, MAX_NUM_TOKENS, NUM_ENTRIES_PER_TOKEN, torch.float8_e4m3fn, NUM_SF_PACKS
++    )
++    buffer.write(
++        [t[rank * n : (rank + 1) * n].clone() for t, n in zip(tables, NUM_ENTRIES_PER_LAYER, strict=True)], sfs=[sf.cuda() for sf in sfs]
++    )
++
++    # Ragged token counts across ranks, including a full and a single-token batch
++    for step, num_tokens in enumerate((MAX_NUM_TOKENS, 1, 7 + rank, 33 - rank)):
++        gen = torch.Generator().manual_seed(100 * step + rank)
++        indices = torch.stack(
++            [torch.randint(0, WORLD_SIZE * n, (num_tokens, NUM_ENTRIES_PER_TOKEN), generator=gen) for n in NUM_ENTRIES_PER_LAYER]
++        )
++        for layer_idx, hook in enumerate(buffer.fetch(indices.int().cuda())):
++            fetched, fetched_sf = hook()
++            expected = tables[layer_idx][indices[layer_idx]].reshape(num_tokens, -1)
++            expected_sf = sfs[layer_idx][indices[layer_idx]].reshape(num_tokens, -1)
++            assert torch.equal(fetched.cpu().view(torch.uint8), expected.view(torch.uint8)), (rank, step, layer_idx)
++            assert torch.equal(fetched_sf.cpu(), expected_sf), (rank, step, layer_idx)
++            assert fetched_sf.stride() == (1, (num_tokens + 3) // 4 * 4)  # TMA-aligned column-major
++    buffer.destroy()
++    dist.destroy_process_group()
++
++
++@pytest.mark.ci
++def test_nvlink_engram_fetch() -> None:
++    """NVLink Engram fetch returns the same rows and scaling factors as a direct lookup on the full table."""
++    if torch.cuda.device_count() < WORLD_SIZE:
++        pytest.skip(f"requires {WORLD_SIZE} GPUs")
++    torch.multiprocessing.spawn(_run_fetch, args=(str(get_open_port()),), nprocs=WORLD_SIZE, join=True)

@@ -1,0 +1,8 @@
+# runtime artefacts, never committed
+logs/
+*.log
+__pycache__/
+*.pyc
+*.pgid
+server.pgid
+.DS_Store

@@ -1,0 +1,6 @@
+# name	url	branch	commit_at_clone	purpose
+deepinfer-main	https://github.com/deepseek-ai/DeepInfer.git	main	9bd9cf243fc53ef9afbf8f04d391d989117d6ab9	官方基准（SM100/Ascend）
+deepinfer-sm90-92	https://github.com/DarkraiHL/DeepInfer.git	sm90-hopper	e205d42e4b28185e50ce30f6b7204cd01e59974c	PR#92 SM90/H20 端到端
+deepinfer-server	https://github.com/yiliu30/deepinfer-server.git	main	f57fce547e25df19f41b9ba32bdbf21d0e0644ec	Anthropic API + recipe 服务层
+deepinfer-serving	https://github.com/carlulsoe/deepinfer-serving.git	main	9cb3ed77d48ec0e04a3fe778e899b5b01219ed52	KV store + PD + LB + autoscaling
+deepseek-recipe	https://github.com/deepseek-ai/deepseek-recipe.git	main	935817c66f5d6e64838f419692545f06787e485f	协议编解码（Rust）+ server-py

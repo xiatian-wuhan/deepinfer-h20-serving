@@ -1,0 +1,31 @@
+# DeepInfer SM90 (#92) on 8×H20-3e — 方案 B：干净的 CUDA 13.2 基底
+# 状态：草稿，未构建验证
+FROM nvidia/cuda:13.2-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-venv python3-pip \
+      git build-essential g++-13 gcc-13 \
+      libibverbs-dev libnuma-dev \
+      ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100
+
+RUN python3.12 -m venv /opt/deepinfer/venv
+ENV PATH=/opt/deepinfer/venv/bin:$PATH
+RUN pip install --upgrade pip wheel setuptools
+
+WORKDIR /opt/deepinfer
+COPY repos/deepinfer-sm90-92 /opt/deepinfer/DeepInfer
+WORKDIR /opt/deepinfer/DeepInfer
+
+ENV DEEPINFER_ACCELERATOR=nvidia
+ENV DEEPINFER_CUDA_ARCH=sm90
+
+# 直接走官方 build.sh（它会自己装 requirements-nvidia / sm90 / nccl 并构建）
+RUN bash ./build.sh
+
+ENV PYTHONPATH=/opt/deepinfer/DeepInfer
+WORKDIR /opt/deepinfer/DeepInfer
+CMD ["/bin/bash"]

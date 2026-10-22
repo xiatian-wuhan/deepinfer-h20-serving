@@ -1,0 +1,124 @@
+"""OpenAI 服务层功能验证：非流式、流式、usage 字段、cached_tokens、metrics。"""
+import json, sys, time, urllib.error, urllib.request
+
+BASE = "http://127.0.0.1:8888"
+MODEL = None  # filled in from /v1/models: --served-model-name is configurable
+ok = fail = 0
+
+def check(name, cond, detail=""):
+    global ok, fail
+    if cond: ok += 1; print(f"  PASS  {name}" + (f"  [{detail}]" if detail else ""))
+    else:    fail += 1; print(f"  FAIL  {name}  [{detail}]")
+
+def post(body, stream=False):
+    req = urllib.request.Request(BASE + "/v1/chat/completions",
+        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    r = urllib.request.urlopen(req, timeout=1800)
+    return r
+
+def get(path):
+    return urllib.request.urlopen(BASE + path, timeout=60).read().decode()
+
+print("=== 1) /v1/models ===")
+m = json.loads(get("/v1/models"))
+MODEL = m["data"][0]["id"]
+check("返回 model list", m.get("object") == "list" and bool(MODEL), MODEL)
+
+print("\n=== 2) 非流式对话 ===")
+t0 = time.perf_counter()
+r = post({"model": MODEL, "messages": [{"role": "user", "content": "用一句话说明什么是 KV cache。"}],
+          "max_tokens": 64, "temperature": 0})
+d = json.loads(r.read()); dt = time.perf_counter() - t0
+ch = d["choices"][0]
+check("有文本输出", bool(ch["message"]["content"].strip()), repr(ch["message"]["content"][:80]))
+check("finish_reason 合法", ch["finish_reason"] in ("stop", "length"), ch["finish_reason"])
+u = d["usage"]
+check("usage 三字段齐全", all(k in u for k in ("prompt_tokens", "completion_tokens", "total_tokens")), json.dumps(u))
+check("有 prompt_tokens_details.cached_tokens（vLLM 兼容）",
+      isinstance(u.get("prompt_tokens_details", {}).get("cached_tokens"), int), json.dumps(u.get("prompt_tokens_details")))
+print(f"  用时 {dt*1e3:.0f} ms, usage={json.dumps(u)}")
+
+print("\n=== 3) 流式对话 SSE ===")
+r = post({"model": MODEL, "messages": [{"role": "user", "content": "数一下 1 到 5，只输出数字。"}],
+          "max_tokens": 32, "temperature": 0, "stream": True,
+          "stream_options": {"include_usage": True}}, stream=True)
+t0 = time.perf_counter(); first = None; parts = []; nchunk = 0; usage = None; done = False; roles = 0
+for raw in r:
+    line = raw.decode().strip()
+    if not line.startswith("data: "): continue
+    p = line[6:]
+    if p == "[DONE]": done = True; break
+    o = json.loads(p); nchunk += 1
+    if o.get("usage"): usage = o["usage"]
+    if o.get("object") != "chat.completion.chunk": check("chunk.object", False, o.get("object"))
+    for c in o.get("choices", []):
+        if c["delta"].get("role") == "assistant": roles += 1
+        t = c["delta"].get("content")
+        if t:
+            if first is None: first = time.perf_counter() - t0
+            parts.append(t)
+check("收到 [DONE]", done)
+check("首帧带 role=assistant", roles >= 1, f"roles={roles}")
+check("有增量文本", len(parts) > 0, f"chunks={nchunk}")
+check("流式也返回 usage（include_usage）", usage is not None, json.dumps(usage))
+if usage:
+    check("流式 usage 含 cached_tokens", isinstance(usage.get("prompt_tokens_details", {}).get("cached_tokens"), int))
+print(f"  chunks={nchunk}, TTFT={first*1e3:.0f} ms, text={''.join(parts)[:80]!r}")
+
+print("\n=== 4) 同一长 prompt 连发两次 -> cached_tokens 应该 > 0 ===")
+import uuid
+# Unique marker FIRST: the prefix cache matches from the start, so a suffix would still hit.
+doc = f"run{uuid.uuid4().hex} " + " ".join(f"tok{i%997}" for i in range(2000))
+msg = [{"role": "system", "content": "You answer questions about this document.\n\n" + doc},
+       {"role": "user", "content": "Reply with the single word: OK"}]
+res = []
+for i in range(2):
+    r = post({"model": MODEL, "messages": msg, "max_tokens": 8, "temperature": 0})
+    d = json.loads(r.read()); c = d["usage"]["prompt_tokens_details"]["cached_tokens"]; res.append(c)
+    print(f"  第 {i+1} 次: prompt_tokens={d['usage']['prompt_tokens']} cached_tokens={c}")
+check("首次请求 cached_tokens 为 0", res[0] == 0, str(res[0]))
+check("第二次命中缓存 cached_tokens > 0", res[1] > 0, str(res[1]))
+
+print("\n=== 5) /deepinfer/metrics ===")
+txt = get("/deepinfer/metrics")
+lines = txt.splitlines()
+hic = [l for l in lines if "hicache" in l and ("hits" in l or "lookups" in l or "hit_rate" in l)]
+check("有 hicache 指标族", len(hic) > 0, f"{len(hic)} 条")
+check("有请求计数指标", any("requests_total" in l for l in lines))
+for l in hic[:4]: print("   ", l)
+
+print("\n=== 6) 图片输入（OpenAI image_url / Anthropic image）===")
+import base64, glob, os
+_IMG = os.environ.get("SERVE_TEST_IMAGE") or next(iter(sorted(glob.glob(
+    "/home/ubuntu/data1/models/*/inference/examples/images/*.jpeg"))), None)
+if not _IMG:
+    print("  SKIP  找不到测试图片（用 SERVE_TEST_IMAGE 指定）")
+else:
+    _b64 = base64.b64encode(open(_IMG, "rb").read()).decode()
+    _txt = [{"role": "user", "content": "Reply with one word."}]
+    _base = json.loads(post({"model": MODEL, "messages": _txt, "max_tokens": 4, "temperature": 0}).read())
+    _img = [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64}"}},
+        {"type": "text", "text": "Reply with one word."}]}]
+    _r = json.loads(post({"model": MODEL, "messages": _img, "max_tokens": 8, "temperature": 0}).read())
+    check("单图请求返回 200", _r.get("object") == "chat.completion")
+    _n = _r["usage"]["prompt_tokens"]
+    check("prompt_tokens 计入图片展开的 token", _n > _base["usage"]["prompt_tokens"] + 20,
+          f"{_n} vs 纯文本 {_base['usage']['prompt_tokens']}")
+    _anth = [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _b64}},
+        {"type": "text", "text": "Reply with one word."}]}]
+    check("Anthropic image 块可用",
+          json.loads(post({"model": MODEL, "messages": _anth, "max_tokens": 8, "temperature": 0}).read()
+                     ).get("object") == "chat.completion")
+    try:
+        post({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}},
+            {"type": "text", "text": "hi"}]}]})
+        _rejected = False
+    except urllib.error.HTTPError as exc:
+        _rejected = exc.code == 400
+    check("默认拒绝外部图片 URL（SSRF 防护）", _rejected)
+
+print(f"\n===== 结果: {ok} passed, {fail} failed =====")
+sys.exit(1 if fail else 0)
