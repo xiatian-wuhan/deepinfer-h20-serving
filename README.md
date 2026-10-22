@@ -321,10 +321,11 @@ num_tokens=24    max=32768   ← 解码每一步
 
 | 项目 | 结果 |
 |---|---|
-| OpenAI 协议回归（`tools/serve_test.py`） | **25 passed, 0 failed** |
+| 协议回归（`tools/serve_test.py`） | **26 passed, 0 failed** |
 | 非流式 / 流式 SSE / usage / cached_tokens | 全部通过 |
 | 前缀缓存 | 同 prompt 二次请求 `cached_tokens=3840/4019` |
-| 图片输入 | 单图、双图、流式、Anthropic 块、URL 拒绝，全部通过 |
+| 图片输入 | 单图、Anthropic 块走 `/v1/messages`、形状不符 400、URL 拒绝，全部通过 |
+| 协议层对表（`tools/recipe_parity.py`） | prompt 文本与 token ids 10/10 相同；输出解析 5/5；控制符注入、图片占位符通过 |
 | 工具调用 | 非流式/流式均返回 `tool_calls`，无 DSML 泄漏 |
 | Engram fetch 正确性（2 卡） | 3 组情形逐字节一致 |
 | 图片 token 数学 | 410 个尺寸与引擎 `compute_image_layout` 比对，**0 处不一致** |
