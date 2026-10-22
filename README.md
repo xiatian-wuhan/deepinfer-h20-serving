@@ -48,10 +48,10 @@ fp8 Engram 表分片后 23.4 GB/rank。
 
 ```
 docker/         单 Dockerfile（含 rdma-core 54 构建块）+ 构建脚本
-patches/        deepinfer-h20-full.patch（相对上游 e205d42 的完整改动，19 文件 +1953）
+patches/        deepinfer-h20-full.patch（相对上游 e205d42 的完整改动，19 文件 +1978）
                 pr*.patch（分项补丁，便于阅读）
 tools/          e2e 窗口、服务压测/回归、profiler、GIN/dma-buf 探针
-notes/          01–18 调查记录（从依赖基线到 1M 布局选型）
+notes/          01–19 调查记录（依赖基线、布局选型、网关排障）
 manifests/      源码仓库与子模块清单
 ```
 
@@ -193,6 +193,25 @@ client.chat.completions.create(
   需要 URL 时显式加 `--allow-image-urls`；
 - 单图上限 64 MiB / `max_image_tokens=1024` 个 prompt token；解码失败返回 400，绝不静默降级为纯文本。
 
+### 6.3 经网关（new-api / one-api）使用
+
+缓存命中数走标准字段 `usage.prompt_tokens_details.cached_tokens`，new-api 会记进用量日志的
+`other.cache_tokens` 并显示为「缓存↓ N」。链路已验证，见
+[`notes/19`](notes/19-cache-usage-through-gateway.md)。
+
+若网关侧看不到缓存数，先看服务端日志而不是改协议——两个开关专为此准备：
+
+```bash
+--log-requests   # 每个请求打一行：[req] rid= stream= include_usage= prompt= cached=
+--always-usage   # 流式一律下发 usage 块，供不发 include_usage 的老网关使用（默认关闭）
+```
+
+- 服务端 `cached=0` 且 `include_usage=1` → 真的没命中：前缀短于 128 token 的块，或服务刚重启（缓存是空的）。
+- `include_usage=0` → 网关没要 usage，它只能自己数 token，缓存数必然为 0。new-api 由
+  `FORCE_STREAM_OPTION`（新版本默认 true）控制；渠道开启「透传请求体」时也不会被注入。
+  此时可让网关补上，或给服务加 `--always-usage`（代价：流式多一个 `choices: []` 的块，
+  对不判空直接取 `choices[0]` 的客户端有风险）。
+
 ### 6.2 参数支持
 
 **生效**：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`seed`、`stream`、
@@ -272,7 +291,7 @@ cd DeepInfer && git checkout e205d42e4b28185e50ce30f6b7204cd01e59974c
 git apply /path/to/patches/deepinfer-h20-full.patch
 ```
 
-补丁内容（19 文件，+1953/−1）包含：SM90 支持、前缀缓存（PR#144）、scheduler API（PR#195）、
+补丁内容（19 文件，+1978/−1）包含：SM90 支持、前缀缓存（PR#144）、scheduler API（PR#195）、
 OpenAI 服务层（PR#147）、NVLink Engram fetch（PR#99），以及本仓库的 Engram 优化、
 `--cp` 透传、图片输入。分项补丁见 `patches/pr*.patch`。
 
@@ -282,6 +301,7 @@ OpenAI 服务层（PR#147）、NVLink Engram fetch（PR#99），以及本仓库�
 
 - DeepInfer: <https://github.com/DarkraiHL/DeepInfer>
 - 上游方法论：`doc/sm90.md`、`doc/inference_deployment_qa.md`
-- 本仓库调查记录：`notes/01`–`notes/18`，其中
+- 本仓库调查记录：`notes/01`–`notes/19`，其中
   [`notes/17`](notes/17-engram-fetch-fix.md)（Engram 修复）与
-  [`notes/18`](notes/18-cp8-for-1m.md)（1M 布局选型）是核心。
+  [`notes/18`](notes/18-cp8-for-1m.md)（1M 布局选型）、
+  [`notes/19`](notes/19-cache-usage-through-gateway.md)（网关下的缓存显示排查）是核心。

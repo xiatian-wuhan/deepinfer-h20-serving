@@ -1001,10 +1001,10 @@ index 0000000..add99d6
 +raise SystemExit(1 if mismatches else 0)
 diff --git a/serve/openai_server.py b/serve/openai_server.py
 new file mode 100644
-index 0000000..eda683a
+index 0000000..d4c5a52
 --- /dev/null
 +++ b/serve/openai_server.py
-@@ -0,0 +1,746 @@
+@@ -0,0 +1,771 @@
 +"""Minimal OpenAI-compatible chat server on top of the DeepInfer offline engine.
 +
 +DeepInfer ships offline inference only. This wraps one `LLM` per data-parallel rank
@@ -1189,6 +1189,19 @@ index 0000000..eda683a
 +    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
 +    p.add_argument("--yoco-keep-tokens", type=int, default=140, help="0 disables decoder SWA bounded replay")
 +    p.add_argument("--thinking-mode", default="chat", choices=["chat", "thinking"])
++    p.add_argument(
++        "--always-usage",
++        action="store_true",
++        help="emit the usage chunk in streaming responses even when the client did not send "
++        "stream_options.include_usage. The OpenAI spec ties it to that flag, but many gateways (new-api, one-api) "
++        "only get cache/billing numbers from an upstream usage chunk and silently fall back to their own tokenizer",
++    )
++    p.add_argument(
++        "--log-requests",
++        action="store_true",
++        help="log one line per finished request (stream/include_usage/prompt/cached) so a gateway that drops "
++        "usage can be told apart from a genuine cache miss",
++    )
 +    p.add_argument(
 +        "--allow-image-urls",
 +        action="store_true",
@@ -1448,7 +1461,8 @@ index 0000000..eda683a
 +        self.ready = 0
 +        self.stats = dict(requests=0, finished=0, aborted=0, errors=0, prompt_tokens=0, completion_tokens=0, encode_fallbacks=0)
 +        self.cache_stats: dict[int, dict] = {}
-+        self.cached: dict[str, int] = {}  # rid -> prefix tokens the host cache resumed (vLLM-style usage)
++        self.cached: dict[str, int] = {}
++        self.req_meta: dict[str, tuple] = {}  # rid -> (stream, include_usage, prompt_len, has_image), for --log-requests
 +        self.loop: asyncio.AbstractEventLoop | None = None
 +
 +    def start(self) -> None:
@@ -1579,7 +1593,15 @@ index 0000000..eda683a
 +    def release(self, rid: str, aborted: bool) -> None:
 +        rank = self.owner.pop(rid, None)
 +        self.streams.pop(rid, None)
-+        self.cached.pop(rid, None)
++        meta = self.req_meta.pop(rid, None)
++        cached = self.cached.pop(rid, 0)
++        if self.args.log_requests and meta is not None:
++            stream, include_usage, prompt_len, has_image = meta
++            print(
++                f"[req] rid={rid[:8]} stream={int(stream)} include_usage={int(include_usage)} "
++                f"images={int(has_image)} prompt={prompt_len} cached={cached} aborted={int(aborted)}",
++                flush=True,
++            )
 +        if rank is None:
 +            return
 +        self.load[rank] -= 1
@@ -1655,6 +1677,7 @@ index 0000000..eda683a
 +            use_cache=bool(body.get("prefix_cache", True)),
 +            multi_modal=multi_modal,
 +        )
++        fe.req_meta[rid] = (bool(body.get("stream")), include_usage, prompt_len, multi_modal is not None)
 +        created = int(time.time())
 +        cid = f"chatcmpl-{rid}"
 +        detok = IncrementalDetokenizer(fe.tokenizer)
@@ -1707,7 +1730,9 @@ index 0000000..eda683a
 +                        if text or finish:
 +                            yield chunk({"content": text} if text else {}, finish)
 +                    done = True
-+                    if include_usage:
++                    if include_usage or fe.args.always_usage:
++                        # `--always-usage`: gateways that never send include_usage still need the numbers,
++                        # otherwise they count tokens locally and cache hits always read as zero.
 +                        yield chunk({}, usage=usage())
 +                    yield "data: [DONE]\n\n"
 +                finally:
