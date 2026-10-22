@@ -169,6 +169,11 @@ fn add_tool_calls_open_branch(&mut self, dsml_open_marker: &[Segment<'_>]) {
   [ok] truncated_block       （max_tokens 截断：保留原文，不谎报 tool_calls）
 ```
 
+> 注意：别用"同一请求跑两次流式/非流式再比文本"来验证顺序。本引擎即使
+> `temperature=0` + 固定 `seed` 也不是逐 token 可复现的（MTP 投机解码 + 批组成变化），
+> 两次生成的文本会不同，看上去像丢字。要验证切块/顺序，用上面这种确定性用例
+> （同一段文本按 2~3 字符切片喂 gate），不要用两次采样。
+
 线上回归：`tools/serve_test.py` **25/25**；`tools/live_order_probe.py` 让模型并行发三个工具调用：
 
 ```
