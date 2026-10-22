@@ -245,3 +245,43 @@ python3 tools/live_order_probe.py
 ```
 
 `check_encoding_parity.py` 退出码非 0 即有用例不通过，可以直接挂到发布前检查里。
+
+---
+
+## 6. 真实流量复核（2026-10-22 23:2x，Claude Code 经 new-api）
+
+26 个请求，最长一条 **120 条消息**（39 system / 12 user / 37 assistant / 32 tool）。
+用 `tools/analyze_trace.py` 解析服务日志里的 `[msgs] in=` 摘要：
+
+| 检查项 | 结果 |
+|---|---|
+| 26 轮工具调用，调用 id 与结果 id 是否一一对应 | 26/26 一致，0 不匹配 |
+| 结果是否按调用顺序送达 | 26/26 是，0 逆序 |
+| 孤立 `tool` 消息（前面没有 `tool_calls`） | 0 |
+| 前缀缓存 | 69840 → 70041 → 70345 → 70983 → 71101 → 74021 tokens，cached = 69760 / 70016 / 70272 / 70912 / 71040（**96–99.7%**） |
+| DSML 解析失败 | 0 |
+
+**缓存这一列是最硬的证据**：如果历史在轮间被重排，前缀会从重排处断开，`cached` 会塌到很小；
+实测一直 ≥96%，说明除新增的尾巴外，每个 token 都与上一轮完全相同——模型读到的就是同一段历史。
+
+### 顺带发现：客户端每轮都带一条 mid-conversation system
+
+顶层 system 之外还有 38 条 system 夹在中间，位置很规律：
+
+| 位置 | 次数 |
+|---|---|
+| `tool -> system -> assistant` | 25 |
+| `user -> system -> assistant` | 12 |
+| `tool -> system -> END` | 1 |
+
+不是 new-api 生成的（它只造顶层 system 一条，`convert.rs` 里没有别的 system 创建点），
+是 Claude Code 自己发的 system-reminder（49 / 79 字符）。V4.1 的规则是"mid-conversation system
+也要接 assistant 头"，所以每个回合的头落在 `<｜System｜>` 之后：
+
+```
+<｜User｜>{tool_result}<｜System｜>{reminder}<｜Assistant｜></think>
+```
+
+两份官方实现都这么渲染（`render_message` 的 `role == "system" and index > 0` 分支），不是 bug。
+若要 A/B，把这类 reminder 并进前一条 user 轮（`<｜User｜>{tool_result}\n\n{reminder}`）即可，
+但那是改语义，不建议默认开。
