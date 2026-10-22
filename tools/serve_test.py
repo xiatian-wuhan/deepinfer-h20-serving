@@ -10,8 +10,8 @@ def check(name, cond, detail=""):
     if cond: ok += 1; print(f"  PASS  {name}" + (f"  [{detail}]" if detail else ""))
     else:    fail += 1; print(f"  FAIL  {name}  [{detail}]")
 
-def post(body, stream=False):
-    req = urllib.request.Request(BASE + "/v1/chat/completions",
+def post(body, stream=False, path="/v1/chat/completions"):
+    req = urllib.request.Request(BASE + path,
         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     r = urllib.request.urlopen(req, timeout=1800)
     return r
@@ -108,9 +108,15 @@ else:
     _anth = [{"role": "user", "content": [
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _b64}},
         {"type": "text", "text": "Reply with one word."}]}]
-    check("Anthropic image 块可用",
-          json.loads(post({"model": MODEL, "messages": _anth, "max_tokens": 8, "temperature": 0}).read()
-                     ).get("object") == "chat.completion")
+    check("Anthropic image 块可用（/v1/messages）",
+          json.loads(post({"model": MODEL, "messages": _anth, "max_tokens": 8, "temperature": 0},
+                          path="/v1/messages").read()).get("type") == "message")
+    try:
+        post({"model": MODEL, "messages": _anth, "max_tokens": 8, "temperature": 0})
+        _anth_chat = False
+    except urllib.error.HTTPError as exc:
+        _anth_chat = exc.code == 400
+    check("chat 端点拒绝 Anthropic image 块（严格 OpenAI schema）", _anth_chat)
     try:
         post({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}},

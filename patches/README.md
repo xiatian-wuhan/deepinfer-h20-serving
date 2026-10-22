@@ -2,7 +2,7 @@
 
 `deepinfer-h20-full.patch` 是**唯一需要应用的补丁**：相对上游
 `DarkraiHL/DeepInfer` 的 `e205d42`（分支 `sm90-hopper`）的完整改动，
-19 文件，+1953 / −1。
+19 文件，+2549 / −1。
 
 ```bash
 git clone https://github.com/DarkraiHL/DeepInfer.git
@@ -20,7 +20,7 @@ git apply /path/to/deepinfer-h20-full.patch
 | SM90 支持（#92） | H20-3e 的算子与调度路径 |
 | 前缀缓存（#144） | `deepinfer/hicache/`，host KV 页池 |
 | scheduler API（#195） | `csrc/engine/` 与 `_C/engine.pyi` |
-| OpenAI 服务层（#147） | `serve/`：chat completions、流式、usage |
+| OpenAI 服务层（#147） | `serve/`：chat completions、流式、usage；协议层交给 deepseek-recipe |
 | NVLink Engram fetch（#99） | `engram_nvlink.py`，无 GIN 时的取数路径 |
 | **本仓库的改动** | Engram fetch 去冗余（性能 2×）、`--cp` 透传、图片输入、模型名可配 |
 

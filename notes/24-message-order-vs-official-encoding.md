@@ -203,6 +203,9 @@ Stage::Finished => ActionOnUnmatched::SkipInvalid { kind: InvalidTokenKind::Cont
 
 ## 4. 规范差异：回答 tool_use 的那条消息必须以 tool_result 开头
 
+> **后续（[`notes/25`](25-recipe-protocol-layer.md)）**：协议层整体换成 `deepseek-recipe` 之后，
+> 这一条不再是我们和官方的差异——本服务现在同样按契约 400。本节保留其原因与影响面的记录。
+
 `convert.rs` 对用户消息逐块处理，文本块前先查"是否还有没被回答的 tool_use"：
 
 ```rust

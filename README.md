@@ -19,6 +19,7 @@ DeepInfer 源码不在此仓库内，用 `patches/deepinfer-h20-full.patch` 打�
 | 单会话解码差在哪？ | Engram fetch 的 padding/copy 冗余，已修复：CP8 **240.6–279.1 tok/s**，DP8 **151.9**（上游参考 158） |
 | 高并发谁更好？ | c=32 时 DP8 吞吐 **2380.6** vs CP8 1777.1；但只要承诺 1M 上下文就只能用 CP8 |
 | 消息顺序会不会乱？ | 不会。请求侧 prompt 与官方编码器**逐 token 相同**，跨轮前缀不变；本轮修掉一处 DSML 探测过严（[`notes/24`](notes/24-message-order-vs-official-encoding.md)） |
+| 协议转换谁来做？ | **deepseek-recipe**（官方 Rust 实现，已在镜像里）。服务只保留"token ids 进、token ids 出"，顺带拿到 `/v1/messages`、`/v1/responses`、`reasoning_content`、缓存命中字段（[`notes/25`](notes/25-recipe-protocol-layer.md)） |
 
 **建议**：1M 上下文 + 并发 ≤32 的场景选 CP8。低于 ~8 并发 CP8 全面更优；
 DP8 只在纯高吞吐（c≥32 短上下文）时领先，但它交付不了 1M。
@@ -160,7 +161,8 @@ CP8 = 注意力 TP8 + 专家 EP8，8 卡服务同一 batch；DP8 = 8 个独立�
 
 **Base URL** `http://<host>:8888/v1` ｜ **模型名** `DeepSeek-V4.1-Flash-1017`（可用 `DEEPINFER_SERVED_MODEL_NAME` 改）
 
-路由：`/v1/chat/completions`、`/v1/models`、`/health`、`/deepinfer/metrics`。
+路由：`/v1/chat/completions`、`/v1/messages`（Anthropic）、`/v1/responses`、`/v1/models`、`/health`、
+`/deepinfer/metrics`。三个协议端点共用同一个引擎和同一套转换/解析实现（见 §6.5）。
 无鉴权（内网部署），`Authorization` 任意非空值即可。
 
 ```python
@@ -190,14 +192,16 @@ client.chat.completions.create(
 )
 ```
 
-- 支持 OpenAI `image_url` 与 Anthropic `image`+`source.base64` 两种写法，单请求可多图且保持顺序；
+- 形状跟着端点走：`/v1/chat/completions` 收 OpenAI `image_url`，`/v1/messages` 收 Anthropic
+  `image` + `source.base64`（把 Anthropic 形状发到 chat 端点会 400，OpenAI schema 就是这么定的）；
+- 单请求可多图且保持顺序，图片也可以落在 `tool_result` 里；
 - 每图在 prompt 里落一个 `<｜deepseek_image｜>`，由引擎按 `compute_image_layout` 展开，
   `usage.prompt_tokens` **计入展开后的 token**（450×308 的图 = 189 token，与返回值逐位核对过）；
 - 默认**只接受内联 base64**。该端点无鉴权，放开任意 URL 等于提供 SSRF 代理；
   需要 URL 时显式加 `--allow-image-urls`；
 - 单图上限 64 MiB / `max_image_tokens=1024` 个 prompt token；解码失败返回 400，绝不静默降级为纯文本。
 
-### 6.4 工具调用
+### 6.2 工具调用
 
 `tools` 按 OpenAI 格式传入即可。请求侧由模型自带的编码器渲染进 prompt，响应侧由**同一个**
 参考实现把模型写出的 DSML 块解析回 `tool_calls`——不解析的话，标记会原样出现在 `content` 里，
@@ -247,17 +251,37 @@ new-api 转成 `content_block_start: tool_use` + `input_json_delta`。
   此时可让网关补上，或给服务加 `--always-usage`（代价：流式多一个 `choices: []` 的块，
   对不判空直接取 `choices[0]` 的客户端有风险）。
 
-### 6.2 参数支持
+### 6.4 参数支持
 
-**生效**：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`seed`、`stream`、
-`stream_options.include_usage`、`tools`（双向：渲染进 prompt，并把模型输出的 DSML 解析成
-`tool_calls`）、`prefix_cache`（非标准，默认 true）。
+**生效**：`max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`top_k`、`seed`、`stop`、
+`stream`、`stream_options.include_usage`、`tools`（双向：渲染进 prompt，并把模型输出的 DSML 解析成
+`tool_calls`）、`reasoning_effort` / `thinking`（选思考模式与努力档，输出切到
+`reasoning_content`）、`response_format`（json_schema / regex，校验并写进 prompt）、`prefix_cache`
+（非标准，默认 true）。
 
-**未实现（会被忽略）**：`stop`、`stop_token_ids`、`top_k`、`min_tokens`、`n>1`、`logit_bias`、
-`presence_penalty`/`frequency_penalty`、`response_format`、`reasoning_effort`。
+**会被接受但不生效**：`presence_penalty` / `frequency_penalty`（DeepSeek 官方 API 也不支持，校验后丢弃）、
+`logprobs`、`min_tokens`、`logit_bias`、`stop_token_ids`。
 
-`usage.prompt_tokens_details.cached_tokens` 与 vLLM 口径一致；前缀缓存命中时
+**会被拒绝**：`n > 1`（400）、`max_tokens` 超出上下文剩余（400）。
+
+`usage` 里带缓存命中：chat completions 是 `prompt_tokens_details.cached_tokens` +
+`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`，messages 是 `cache_read_input_tokens`；
+思考模式还有 `completion_tokens_details.reasoning_tokens`。前缀缓存命中时
 `/deepinfer/metrics` 另有 `hicache` 计数。
+
+### 6.5 协议层：deepseek-recipe
+
+请求转换、prompt 渲染/编码、输出解析都交给 [`deepseek-recipe`](https://github.com/deepseek-ai/deepseek-recipe)
+（DeepSeek 官方的 Rust 实现，已装在镜像里）。服务只负责"给 token ids、吐 token ids"这一段。
+
+```bash
+serve/server.sh start --dp 8 --cp 8 --max-num-seqs 32 --port 8888                        # 默认 recipe
+serve/server.sh start --dp 8 --cp 8 --max-num-seqs 32 --port 8888 --protocol-layer builtin  # 旧路径，A/B
+```
+
+和 checkpoint 自带参考编码器逐 token 对表：10/10 用例 prompt 与 token ids 相同；
+控制符注入（用户文本里写 `<｜Assistant｜>`）在旧路径会变成真控制符，新路径只是文字。
+风险与取舍见 [`notes/25`](notes/25-recipe-protocol-layer.md)。
 
 ---
 

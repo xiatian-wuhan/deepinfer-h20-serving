@@ -826,18 +826,17 @@ index 8765cad..84453ce 100644
              num_entries_per_layer,
 diff --git a/serve/README.md b/serve/README.md
 new file mode 100644
-index 0000000..b65a343
+index 0000000..9c81d30
 --- /dev/null
 +++ b/serve/README.md
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,90 @@
 +# Serving DeepInfer + host prefix cache (local additions, not part of upstream)
 +
 +## Pieces
 +
 +- `serve/openai_server.py` — OpenAI-compatible `/v1/chat/completions` (streaming, `tools`, usage) on top of the
-+  offline engine: one engine process per GPU (attention DP + MoE EP), prompts rendered with the checkpoint's own
-+  `encoding.py`. `serve/server.sh start|stop` runs it as a process group (stop reaps the engine helpers, which
-+  otherwise keep the GPUs).
++  offline engine: one engine process per GPU (attention DP + MoE EP). `serve/server.sh start|stop` runs it as a
++  process group (stop reaps the engine helpers, which otherwise keep the GPUs).
 +- `deepinfer/hicache/` — host-memory prefix cache (SGLang HiCache style): pinned host pools organized in pages
 +  (one page = one 128-token KV block) plus SWA state slots, hash-chain index, LRU eviction, write-through at the
 +  end of every prefill, "kernel" transfers (a CUDA kernel copying pages through UVA pointers on the engine
@@ -865,6 +864,21 @@ index 0000000..b65a343
 +against 189 s at `--cp 1`, while `--cp 1` keeps ~34% more total throughput at 32 concurrent requests
 +(notes/18-cp8-for-1m.md).
 +
++### Protocol layer
++
++Request conversion, prompt rendering and output parsing are `deepseek-recipe`'s (the official Rust
++implementation, vendored in the image as `import deepseek_recipe`; `--protocol-layer recipe`, the
++default). The request becomes a `Conversation`, the conversation is rendered and encoded into token
++ids, and the engine's token ids go through a `StreamProcessor` that emits the protocol's own chunks.
++`--protocol-layer builtin` selects the older hand-written layer; `tools/recipe_parity.py` asserts the
++two agree on prompt text, token ids and parsed calls (see the serving notes).
++
++Endpoints: `/v1/chat/completions`, `/v1/messages` (Anthropic) and `/v1/responses`, all streaming or
++not, from the same engine. Usage carries the cache split in each protocol's own fields —
++`prompt_tokens_details.cached_tokens` plus `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` for
++Chat Completions, `cache_read_input_tokens` for Messages — and `completion_tokens_details.reasoning_tokens`
++in thinking mode.
++
 +### Image input
 +
 +`/v1/chat/completions` accepts OpenAI-style content parts. Each image becomes
@@ -879,9 +893,11 @@ index 0000000..b65a343
 +    {"type": "text", "text": "describe this"}]}]}'
 +```
 +
-+Accepted block shapes: `{"type":"image_url","image_url":{"url":...}}` (OpenAI) and
-+`{"type":"image","source":{"type":"base64","data":...}}` (Anthropic). Multiple images per request
-+keep their order. Only **inline base64 `data:` URLs** are allowed by default: this endpoint has no
++The block shape follows the endpoint: `{"type":"image_url","image_url":{"url":...}}` on
++`/v1/chat/completions`, `{"type":"image","source":{"type":"base64","data":...}}` on `/v1/messages`.
++A Messages-shaped image block sent to Chat Completions is rejected with 400, as the OpenAI schema
++says. Images may also sit inside a `tool_result` block. Multiple images per request keep their order.
++Only **inline base64 `data:` URLs** are allowed by default: this endpoint has no
 +authentication, so fetching arbitrary URLs would turn it into an SSRF proxy. Pass
 +`--allow-image-urls` to also accept `http(s)://` and local paths. Images are capped at 64 MiB and at
 +`max_image_tokens` (1024) prompt tokens each; a request whose images cannot be decoded is rejected
@@ -1001,10 +1017,10 @@ index 0000000..add99d6
 +raise SystemExit(1 if mismatches else 0)
 diff --git a/serve/openai_server.py b/serve/openai_server.py
 new file mode 100644
-index 0000000..5ca1fc1
+index 0000000..1caa5b5
 --- /dev/null
 +++ b/serve/openai_server.py
-@@ -0,0 +1,1005 @@
+@@ -0,0 +1,1326 @@
 +"""Minimal OpenAI-compatible chat server on top of the DeepInfer offline engine.
 +
 +DeepInfer ships offline inference only. This wraps one `LLM` per data-parallel rank
@@ -1013,9 +1029,13 @@ index 0000000..5ca1fc1
 +
 +    python serve/openai_server.py --model ~/models/DeepSeek-V4.1-Flash-1017 --dp 4 --port 8888
 +
-+Tool calling: `tools` are rendered into the prompt by the checkpoint's own encoder, and the DSML block
-+the model writes back is parsed into OpenAI `tool_calls` (streamed as `delta.tool_calls`) by that same
-+reference implementation. Without this the markup reaches the client as plain text.
++Protocol layer: request conversion, prompt rendering and output parsing come from `deepseek-recipe`,
++the official Rust implementation of DeepSeek's protocol stack (vendored in this image, `import
++deepseek_recipe`). A request becomes a `Conversation`; the conversation is rendered and encoded into
++token ids; the engine's token ids go back through a `StreamProcessor` that emits the protocol's own
++chunks. That is the same code DeepSeek serves with, so the prompt bytes, the DSML parser and the
++tool-call streaming are not a reimplementation. `--protocol-layer builtin` keeps the older hand-written
++layer for A/B; `tools/recipe_parity.py` asserts both agree on prompt text, token ids and parsed calls.
 +"""
 +
 +from __future__ import annotations
@@ -1168,6 +1188,198 @@ index 0000000..5ca1fc1
 +        total += _image_token_count(width, height, vision)
 +    return {"image_bytes": image_bytes, "image_sizes": image_sizes}, total
 +
++
++# --------------------------------------------------------------------------- protocol layer
++try:  # shipped in this image; --protocol-layer builtin is the fallback path
++    import deepseek_recipe as dr
++except ImportError:  # pragma: no cover - only when the wheel is absent
++    dr = None
++
++
++def _checkpoint_image_token(model_dir: Path) -> str:
++    """The checkpoint's own spelling of the image placeholder.
++
++    Only the token id reaches the model (129264 here); the spelling is a tokenizer fact. V4.1-1017 calls
++    it `<｜deepseek_image｜>` while the released recipe writes `<｜image｜>`, so read the spelling back from
++    the checkpoint's tokenizer.json and hand that to recipe. A mismatch is silent corruption - the
++    placeholder would encode as text and the image would never reach the vision encoder.
++    """
++    default = dr.SpecialToken.Image.default_str()
++    try:
++        added = json.loads((model_dir / "tokenizer.json").read_text()).get("added_tokens") or []
++    except (OSError, ValueError):
++        return default
++    for entry in added:
++        if entry.get("id") == dr.IMAGE_SPECIAL_TOKEN_ID and entry.get("content"):
++            return entry["content"]
++    return default
++
++
++def _image_records(messages: list[dict]) -> list[dict]:
++    """Image records in prompt order - the order recipe numbers its placeholders in.
++
++    Mirrors the checkpoint's `encoding._extract_image`: an OpenAI block carries `image_url.url`, an
++    Anthropic block carries `source`, and a `tool_result` may nest further blocks. Returning the raw block
++    would lose the nesting (`_load_image_bytes` looks for a flat `data`/`source`/`url`).
++    """
++    records: list[dict] = []
++
++    def walk(blocks: Any) -> None:
++        if not isinstance(blocks, list):
++            return
++        for block in blocks:
++            if not isinstance(block, dict):
++                continue
++            kind = block.get("type")
++            if kind in ("image", "image_url"):
++                record: dict = {"type": "image"}
++                if kind == "image_url":
++                    image_url = block.get("image_url")
++                    record["url"] = (
++                        image_url if isinstance(image_url, str) else (image_url or {}).get("url", "")
++                    )
++                else:
++                    for key in ("source", "url", "data"):
++                        if key in block:
++                            record[key] = block[key]
++                records.append(record)
++            elif kind == "tool_result":
++                walk(block.get("content"))
++
++    for message in messages:
++        walk(message.get("content"))
++    return records
++
++
++class _Prepared:
++    """One request converted, rendered and encoded: everything the engine and the parser need."""
++
++    __slots__ = ("protocol", "converted", "prompt_ids", "multi_modal", "image_tokens", "max_tokens")
++
++    def __init__(self, protocol, converted, prompt_ids, multi_modal, image_tokens, max_tokens) -> None:
++        self.protocol = protocol
++        self.converted = converted
++        self.prompt_ids = prompt_ids
++        self.multi_modal = multi_modal
++        self.image_tokens = image_tokens
++        self.max_tokens = max_tokens
++
++    @property
++    def stream(self) -> bool:
++        return bool(self.converted.stream)
++
++
++def _finish_reason(reason: str | None, generated: int, max_tokens: int):
++    """Map the engine's stop reason onto the parser's; the parser overrides it with `tool_calls`."""
++    if "length" in str(reason or "").lower() or generated >= max_tokens:
++        return dr.InferenceFinishReason.Length
++    return dr.InferenceFinishReason.Stop
++
++
++async def recipe_response(fe: Frontend, protocol: str, body: dict):
++    """Serve one request through deepseek-recipe: convert -> render -> encode -> engine -> parse."""
++    from fastapi.responses import JSONResponse, Response, StreamingResponse
++
++    if fe.ready != fe.args.num_engines:
++        return JSONResponse({"error": {"message": "engine loading"}}, status_code=503)
++    try:
++        prepared = await asyncio.to_thread(fe.prepare, protocol, body)
++    except dr.ConversionError as exc:
++        return Response(content=exc.body, status_code=exc.status_code, media_type="application/json")
++    except Exception as exc:  # noqa: BLE001 - bad request shapes and undecodable images land here
++        return JSONResponse(
++            {"error": {"message": str(exc), "type": "invalid_request_error"}}, status_code=400
++        )
++
++    prompt_len = len(prepared.prompt_ids) + prepared.image_tokens
++    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
++    fe.stats["prompt_tokens"] += prompt_len
++    # Non-standard request field: "prefix_cache": false bypasses the host prefix cache lookup (A/B checks).
++    rid, q = fe.submit(
++        prepared.prompt_ids,
++        fe.sampling(body, prepared),
++        fe.affinity_key(body),
++        use_cache=bool(body.get("prefix_cache", True)),
++        multi_modal=prepared.multi_modal,
++    )
++    fe.req_meta[rid] = (prepared.stream, include_usage, prompt_len, prepared.multi_modal is not None)
++
++    request_type, response_type = fe.request_types[protocol]
++    response_id = f"{protocol.split('_')[0]}-{rid}"
++    generator = request_type.chunk_generator(prepared.converted, response_id, fe.model_name)
++    processor = dr.StreamProcessor(generator, prepared.converted.parsing_options, tokenizer=fe.rtok)
++    created = int(time.time())
++    generated = 0
++
++    async def outputs():
++        """Engine token ids in, protocol chunks out (usage included)."""
++        nonlocal generated
++        announced = False
++        while True:
++            item = await q.get()
++            if item[0] == "error":
++                raise RuntimeError(item[1])
++            _, token_id, finished, reason, _ = item
++            if not announced:
++                # The worker puts the cache-hit size on the queue before the first token, so it is
++                # settled by now. Reporting it up front is what fills prompt_tokens_details.cached_tokens.
++                announced = True
++                ready = dr.InferenceChunk.ready(
++                    prompt_usage=dr.PromptUsage(
++                        prompt_tokens=prompt_len,
++                        prompt_cache_hit_tokens=fe.cached.get(rid, 0),
++                    )
++                )
++                for out in processor.push(ready):
++                    yield out
++            if token_id is not None and token_id != fe.eos_token_id:
++                generated += 1
++                fe.stats["completion_tokens"] += 1
++                for out in processor.push(dr.InferenceChunk.tokens([token_id])):
++                    yield out
++            if finished:
++                finish = _finish_reason(reason, generated, prepared.max_tokens)
++                for out in processor.push(dr.InferenceChunk.finish(finish)):
++                    yield out
++                for out in processor.finish():
++                    yield out
++                return
++
++    def close(aborted: bool) -> None:
++        fe.release(rid, aborted=aborted)
++        processor.close()
++        if aborted:
++            fe.stats["errors"] += 1
++
++    if prepared.stream:
++
++        async def sse():
++            done = False
++            try:
++                async for out in outputs():
++                    event = response_type.sse_event_name(out)
++                    prefix = f"event: {event}\n" if event is not None else ""
++                    yield f"{prefix}data: {out.to_json()}\n\n"
++                done = True
++            finally:
++                close(aborted=not done)
++            tail = response_type.sse_done_data()
++            if tail is not None:
++                yield f"data: {tail}\n\n"
++
++        return StreamingResponse(sse(), media_type="text/event-stream")
++
++    done = False
++    response = response_type(response_id, fe.model_name, created, 0, 0)
++    try:
++        async for out in outputs():
++            response.accumulate(out)
++        done = True
++    finally:
++        close(aborted=not done)
++    return Response(content=response.to_json(), media_type="application/json")
++
++
 +class _ToolCallGate:
 +    """Withhold the tail of a stream until it is clear whether a DSML tool-call block has started.
 +
@@ -1241,6 +1453,14 @@ index 0000000..5ca1fc1
 +    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
 +    p.add_argument("--yoco-keep-tokens", type=int, default=140, help="0 disables decoder SWA bounded replay")
 +    p.add_argument("--thinking-mode", default="chat", choices=["chat", "thinking"])
++    p.add_argument(
++        "--protocol-layer",
++        default="recipe",
++        choices=["recipe", "builtin"],
++        help="recipe: deepseek-recipe converts the request, renders/encodes the prompt and parses the "
++        "model output (the official stack, also serves /v1/messages and /v1/responses). builtin: the "
++        "hand-written layer, kept for A/B against recipe",
++    )
 +    p.add_argument(
 +        "--always-usage",
 +        action="store_true",
@@ -1480,28 +1700,8 @@ index 0000000..5ca1fc1
 +
 +class Frontend:
 +    def __init__(self, args: argparse.Namespace) -> None:
-+        from transformers import AutoTokenizer
-+
-+        sys.path.insert(0, str(Path(args.model) / "encoding"))
-+        # The checkpoint's own prompt-format reference: it both renders `tools` into the prompt and parses
-+        # the DSML block the model writes back.
-+        from encoding import (
-+            decode_dsml_to_arguments,
-+            dsml_token,
-+            encode_messages,
-+            parse_tool_calls,
-+            tool_calls_block_name,
-+        )
-+
 +        self.args = args
 +        self.model_name = args.served_model_name or args.model
-+        self.encode_messages = encode_messages
-+        self._parse_tool_calls = parse_tool_calls
-+        self._decode_dsml_to_arguments = decode_dsml_to_arguments
-+        self.dsml_token = dsml_token
-+        self.tool_calls_marker = f"<{dsml_token}"
-+        self.tool_calls_open = f"<{dsml_token}{tool_calls_block_name}"
-+        self.tokenizer = AutoTokenizer.from_pretrained(args.model)
 +        # Vision config drives image-token accounting; absent means the checkpoint is text only.
 +        vision: dict = {}
 +        config_file = Path(args.model) / "config.json"
@@ -1512,6 +1712,14 @@ index 0000000..5ca1fc1
 +                vision = {}
 +        self.vision = vision
 +        self.has_vision = bool(vision)
++        self.protocol_layer = args.protocol_layer
++        if self.protocol_layer == "recipe" and dr is None:
++            print("[server] deepseek-recipe is not importable; using the builtin protocol layer", flush=True)
++            self.protocol_layer = "builtin"
++        if self.protocol_layer == "recipe":
++            self._init_recipe()
++        else:
++            self._init_builtin()
 +        ctx = mp.get_context("spawn")
 +        self.out_q: mp.Queue = ctx.Queue()
 +        self.in_qs: list[mp.Queue] = [ctx.Queue() for _ in range(args.num_engines)]
@@ -1529,6 +1737,115 @@ index 0000000..5ca1fc1
 +        self.cached: dict[str, int] = {}
 +        self.req_meta: dict[str, tuple] = {}  # rid -> (stream, include_usage, prompt_len, has_image), for --log-requests
 +        self.loop: asyncio.AbstractEventLoop | None = None
++
++    def _init_builtin(self) -> None:
++        """The hand-written layer: the checkpoint's reference encoder renders, this file parses."""
++        from transformers import AutoTokenizer
++
++        sys.path.insert(0, str(Path(self.args.model) / "encoding"))
++        # The checkpoint's own prompt-format reference: it both renders `tools` into the prompt and parses
++        # the DSML block the model writes back.
++        from encoding import (
++            decode_dsml_to_arguments,
++            dsml_token,
++            encode_messages,
++            parse_tool_calls,
++            tool_calls_block_name,
++        )
++
++        self.encode_messages = encode_messages
++        self._parse_tool_calls = parse_tool_calls
++        self._decode_dsml_to_arguments = decode_dsml_to_arguments
++        self.dsml_token = dsml_token
++        self.tool_calls_marker = f"<{dsml_token}"
++        self.tool_calls_open = f"<{dsml_token}{tool_calls_block_name}"
++        self.tokenizer = AutoTokenizer.from_pretrained(self.args.model)
++
++    def _init_recipe(self) -> None:
++        """Wire `deepseek-recipe`: convert, render, encode in; parse, stream, account usage out."""
++        model_dir = Path(self.args.model)
++        specials = dr.SpecialTokens(image=_checkpoint_image_token(model_dir))
++        self.conv_options = (
++            dr.ConversionOptions()
++            .with_special_tokens(specials)
++            # The service's --thinking-mode is the default for requests that say nothing; a client that
++            # sends `thinking` or `reasoning_effort` still overrides it per request.
++            .with_default_thinking_mode(self.args.thinking_mode == "thinking")
++            .with_model_alias(self.model_name, dr.ModelVersion.DeepseekV41Flash)
++        )
++        self.rtok = dr.Tokenizer.from_file(str(model_dir / "tokenizer.json"))
++        self.encoding = dr.DeepseekV41Encoding().with_special_tokens(specials).with_tokenizer(self.rtok)
++        self.request_types = {
++            "chat_completions": (dr.ChatCompletionRequest, dr.ChatCompletionResponse),
++            "messages": (dr.MessagesRequest, dr.MessagesResponse),
++            "responses": (dr.ResponsesRequest, dr.ResponsesResponse),
++        }
++        config = {}
++        try:
++            config = json.loads((model_dir / "config.json").read_text())
++        except (OSError, ValueError):
++            pass
++        eos = config.get("eos_token_id")
++        self.eos_token_id = int(eos[0] if isinstance(eos, list) else eos or 1)
++        # `encode` runs on CPU threads; the Rust handles are shared, so serialise the conversion step.
++        self._encode_lock = threading.Lock()
++        print(
++            f"[server] protocol layer: deepseek-recipe {dr.__version__} "
++            f"(image token {specials.token(dr.SpecialToken.Image)}, eos {self.eos_token_id})",
++            flush=True,
++        )
++
++    def prepare(self, protocol: str, body: dict) -> _Prepared:
++        """Convert one protocol request into engine input. CPU work: call it from a thread."""
++        payload = dict(body)
++        payload["model"] = payload.get("model") or self.model_name
++        request_type = self.request_types[protocol][0]
++        try:
++            request = request_type(json.dumps(payload).encode())
++        except (TypeError, ValueError) as exc:
++            raise ValueError(f"invalid {protocol} request: {exc}") from exc
++        with self._encode_lock:
++            converted = request.convert(self.conv_options)
++            rendered = self.encoding.render_conversation(converted.conversation)
++            prompt_ids = self.encoding.encode(converted.conversation)
++        messages = [dict(m) for m in payload.get("messages") or []]
++        if self.args.log_requests:
++            self._log_message_order(messages)
++            self._log_prompt_order(rendered.prompt)
++        multi_modal, image_tokens = None, 0
++        if rendered.image_sources:
++            if not self.has_vision:
++                raise ValueError("this checkpoint has no vision encoder; image input is not supported")
++            records = _image_records(messages)
++            if len(records) != len(rendered.image_sources):
++                raise ValueError(
++                    f"{len(rendered.image_sources)} image placeholder(s) but {len(records)} image block(s) "
++                    f"in 'messages'; image input is only wired for the Messages/Chat Completions message list"
++                )
++            multi_modal, image_tokens = _resolve_images(records, self.vision, self.args.allow_image_urls)
++        # Images cost more prompt tokens than the single placeholder each occupies in `prompt_ids`.
++        prompt_len = len(prompt_ids) + image_tokens
++        max_tokens = converted.resolve_max_tokens(prompt_len, self.args.max_model_len)
++        return _Prepared(protocol, converted, prompt_ids, multi_modal, image_tokens, max_tokens)
++
++    @staticmethod
++    def sampling(body: dict, prepared: _Prepared) -> dict:
++        """The engine's sampler settings, taken from the request.
++
++        `deepseek-recipe` also reports `InferenceOptions`, but it deliberately resolves V4.1's `top_p` to
++        1.0 outside thinking mode and drops `top_k`/penalties; a client that sets them expects them to
++        apply, so the wire values win here and the recipe values are only used for `max_tokens`.
++        """
++        sampling = dict(
++            temperature=float(body.get("temperature", 1.0)),
++            top_p=float(body.get("top_p", 1.0)),
++            top_k=int(body.get("top_k", -1)),
++            ignore_eos=bool(body.get("ignore_eos", False)),
++            max_tokens=int(prepared.max_tokens),
++        )
++        if body.get("seed") is not None:
++            sampling["seq_seed"] = int(body["seed"])
++        return sampling
 +
 +    def start(self) -> None:
 +        for p in self.procs:
@@ -1842,6 +2159,8 @@ index 0000000..5ca1fc1
 +
 +    @app.post("/v1/chat/completions")
 +    async def chat(request: Request):
++        if fe.protocol_layer == "recipe":
++            return await recipe_response(fe, "chat_completions", await request.json())
 +        if fe.ready != fe.args.num_engines:
 +            return JSONResponse({"error": {"message": "engine loading"}}, status_code=503)
 +        body = await request.json()
@@ -1991,6 +2310,24 @@ index 0000000..5ca1fc1
 +            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
 +            "usage": usage(cached_tokens),
 +        }
++
++    @app.post("/v1/messages")
++    async def messages(request: Request):
++        """Anthropic Messages API: same engine, recipe's Messages conversion and event stream."""
++        if fe.protocol_layer != "recipe":
++            return JSONResponse(
++                {"error": {"message": "the Messages API needs --protocol-layer recipe"}}, status_code=501
++            )
++        return await recipe_response(fe, "messages", await request.json())
++
++    @app.post("/v1/responses")
++    async def responses(request: Request):
++        """OpenAI Responses API: same engine, recipe's Responses conversion and event stream."""
++        if fe.protocol_layer != "recipe":
++            return JSONResponse(
++                {"error": {"message": "the Responses API needs --protocol-layer recipe"}}, status_code=501
++            )
++        return await recipe_response(fe, "responses", await request.json())
 +
 +    return app
 +
