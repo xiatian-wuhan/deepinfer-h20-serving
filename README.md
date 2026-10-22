@@ -29,7 +29,7 @@ DP8 只在纯高吞吐（c≥32 短上下文）时领先，但它交付不了 1M
 | 项 | 值 |
 |---|---|
 | GPU | 8 × NVIDIA H20-3e，141 GB HBM3e/卡 |
-| 驱动 | 595.91.07（`nvidia-driver-595-server`） |
+| 驱动 | 595.91.07 **开源内核模块**（`nvidia-driver-595-server-open`），GIN 可用 |
 | 内核 | 6.8.0-57-generic，Ubuntu 22.04，UEFI |
 | 内存 | 2015 GB（可用 1953 GB） |
 | 网络 | RoCE `mlx5_0` 100 Gb ACTIVE（`mlx5_1` DOWN）；`NCCL_IB_HCA=mlx5_0` |
@@ -51,7 +51,7 @@ docker/         单 Dockerfile（含 rdma-core 54 构建块）+ 构建脚本
 patches/        deepinfer-h20-full.patch（相对上游 e205d42 的完整改动，19 文件 +2080）
                 pr*.patch（分项补丁，便于阅读）
 tools/          e2e 窗口、服务压测/回归、profiler、GIN/dma-buf 探针
-notes/          01–20 调查记录（依赖基线、布局选型、网关排障、工具调用）
+notes/          01–23 调查记录（依赖基线、布局选型、网关排障、工具调用、驱动/GIN）
 manifests/      源码仓库与子模块清单
 ```
 
@@ -82,13 +82,15 @@ CP8 时只有一个引擎，所以 `--max-num-seqs` 直接决定整机并发上�
 必需的环境变量：
 
 ```bash
-EP_DISABLE_GIN=1                 # 本机无 GIN；同时打开 PR#99 的 NVLink Engram 快路径（双关）
-DEEPINFER_ENGRAM_NVLINK_FETCH=1
 DEEPINFER_USE_NEXTN_DECODE=5     # MTP 深度
 DEEPINFER_ENABLE_MTP_VARLEN=1    # MTP 真正的开关，默认 False；漏了会看到 accept=0%
 DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE=compact
 DEEPINFER_YOCO_PREFILL_KEEP_TOKENS=140
 ```
+
+GIN 需要**开源内核模块**（见[九、已知限制](#九已知限制)）。换好之后不要再设
+`EP_DISABLE_GIN=1`——那会让 DeepEP 回退到 NCCL 并启用 NVLink Engram 回退路径，
+实测比 GIN 慢约 14%（TPOT 6.5 vs 5.6 ms）。
 
 ### 3. 验证
 
@@ -135,6 +137,7 @@ c=32 时单请求 TTFT（1K 输入）：CP8 **2.30 s** / DP8 3.69 s。
 | DP8 c=32 吞吐 | 1615.7 | **2380.6** |
 | DP8 c=64 吞吐 | 2770.6 | **3826.7** |
 | CP8 c=1 解码 | 199.1–231.8 | **240.6–279.1** |
+| Engram 路径（serve_bench，c=1 热态） | NVLink 回退 TPOT 6.5 ms / 153.0 tok/s | **GIN 原生 TPOT 5.6 ms / 177.9 tok/s** |
 | CP8 c=32 吞吐 | 1720.9 | **1777.1** |
 
 DP8 c=1 达到上游参考（158 tok/s）的 **96%**，TPOT 差 4%。
@@ -302,10 +305,10 @@ num_tokens=24    max=32768   ← 解码每一步
 
 ## 九、已知限制
 
-- **GIN 不可用**：本机 `nvidia-peermem.ko` 是 7.9 KB 空壳，
-  `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED=0`（改 `iommu=pt` 也救不回来），
-  DeepEP 只能走 NCCL 回退。这大概率是 CP8 1M 比参考慢 5%、c=32 吞吐低于参考的原因，未做最终证明。
-  详见 [`notes/06`](notes/06-engram-gin-rootcause.md)–[`notes/08`](notes/08-nvidia-escalation.md)。
+- **GIN 依赖开源内核模块**：专有模块下 `nvidia-peermem` 是桩（`init_module` 恒返回 `-EINVAL`），
+  且 `cuDeviceGetAttribute(124, DMA_BUF_SUPPORTED)=0`，NCCL 因此拒绝 GIN。
+  换成 `nvidia-driver-595-server-open`（同版本，只换内核模块）后 attr 124 变 1、GIN 探针通过。
+  过程与回滚见 [`notes/23`](notes/23-driver-swap-gin.md)，可行性分析见 [`notes/21`](notes/21-gin-fixability.md)。
 - **CP8 的 c=64 未测**（需求只到 32）。
 - **多轮图文**：历史轮次的图片会被重新送、重新计费 prefill；图像段的前缀缓存命中未验证。
 - `BATCH_INVARIANT` 在 SM90 不支持（上游限制）。
@@ -331,8 +334,9 @@ OpenAI 服务层（PR#147）、NVLink Engram fetch（PR#99），以及本仓库�
 
 - DeepInfer: <https://github.com/DarkraiHL/DeepInfer>
 - 上游方法论：`doc/sm90.md`、`doc/inference_deployment_qa.md`
-- 本仓库调查记录：`notes/01`–`notes/20`，其中
+- 本仓库调查记录：`notes/01`–`notes/23`，其中
   [`notes/17`](notes/17-engram-fetch-fix.md)（Engram 修复）与
   [`notes/18`](notes/18-cp8-for-1m.md)（1M 布局选型）、
   [`notes/19`](notes/19-cache-usage-through-gateway.md)（网关下的缓存显示排查）、
-  [`notes/20`](notes/20-tool-calls-dsml.md)（工具调用解析）是核心。
+  [`notes/20`](notes/20-tool-calls-dsml.md)（工具调用解析）、
+  [`notes/23`](notes/23-driver-swap-gin.md)（换开源模块修好 GIN）是核心。
