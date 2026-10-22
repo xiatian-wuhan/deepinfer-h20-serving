@@ -114,7 +114,7 @@ prompt_ids → ③ 引擎 → 采样出的 token_ids → ④ token_ids → 各�
 | `/v1/messages/count_tokens` | 无 | ✅ 渲染+编码后报 `input_tokens`，与 `usage.input_tokens` 逐位相同 |
 | `/v1/responses`（OpenAI Responses） | 无 | ✅ 原生，含 `output[].content[].output_text` |
 | 思考模式输出切分 | 无（`<think>` 会漏进正文） | ✅ `delta.reasoning_content` + `completion_tokens_details.reasoning_tokens` |
-| 缓存命中 | 手写 `prompt_tokens_details.cached_tokens` | ✅ 三协议各自的字段：`cached_tokens`、`prompt_cache_hit_tokens`/`miss`、`cache_read_input_tokens` |
+| 缓存命中 | 手写 `prompt_tokens_details.cached_tokens` | ✅ 三协议各自的字段、同一个数字：`cached_tokens`、`prompt_cache_hit_tokens`/`miss`、`cache_read_input_tokens`（实测 2560，见 README §6.7） |
 | 用户文本里的控制符 | 会变成真控制符 | ✅ 只是文字 |
 | DSML 近失配容错 | 手写 `tolerant_tool_calls`（曾差一） | ✅ 官方解析器的 `NewlinesAndMarker` + `Skip` |
 

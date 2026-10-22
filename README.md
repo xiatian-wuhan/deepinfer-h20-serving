@@ -295,7 +295,7 @@ serve/server.sh start --dp 8 --cp 8 --max-num-seqs 32 --port 8888 --protocol-lay
 |---|---|---|
 | Chat Completions `POST /chat/completions` | ✅ `/v1/chat/completions` | 流式/非流式、tools、usage |
 | Responses API `POST /responses` | ✅ `/v1/responses` | `output[].content[].output_text` |
-| Anthropic `base_url=…/anthropic` | ✅ `/anthropic/v1/messages`（`/v1/messages` 同样可用） | 事件流、`cache_read_input_tokens` |
+| Anthropic `base_url=…/anthropic` | ✅ `/anthropic/v1/messages`（`/v1/messages` 同样可用） | 事件流、`cache_read_input_tokens`；`claude-*` 模型名自动映射（同官网） |
 | `POST /messages/count_tokens` | ✅ `/v1/messages/count_tokens` | 15 == `usage.input_tokens` 15 |
 | 思考模式 `thinking` / `reasoning_effort` | ✅ | `reasoning_content`、`reasoning_tokens` |
 | JSON Output `response_format` | ✅ `json_object` / `json_schema` | 写进 prompt 并约束格式 |
@@ -320,6 +320,40 @@ Claude Code 直接按官网的写法接：
 export ANTHROPIC_BASE_URL=http://<host>:8888/anthropic
 export ANTHROPIC_API_KEY=x      # 无鉴权，随意非空
 ```
+
+### 6.7 缓存命中怎么上报
+
+三个协议都上报，字段按各自规范，同一段前缀在三处命中数相同（实测都是 2560）：
+
+| 协议 | 字段 | 非流式 | 流式 |
+|---|---|---|---|
+| Chat Completions | `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`（官网同名字段）+ `prompt_tokens_details.cached_tokens`（OpenAI 字段） | ✅ | ✅ 最后一个 chunk |
+| Responses | `usage.input_tokens_details.cached_tokens`（官网 Responses 用的就是这个字段） | ✅ | ✅ `response.completed` / `response.incomplete` |
+| Messages | `usage.cache_read_input_tokens` + `cache_creation_input_tokens` | ✅ | ✅ `message_start` 与 `message_delta` |
+
+实测（同一段 2818 token 的 prompt，第二次请求）：
+
+```
+chat       prompt_tokens=2818  prompt_cache_hit_tokens=2560  prompt_cache_miss_tokens=258
+           prompt_tokens_details.cached_tokens=2560
+responses  input_tokens=2818   input_tokens_details.cached_tokens=2560
+messages   input_tokens=258    cache_read_input_tokens=2560    cache_creation_input_tokens=0
+```
+
+Messages 的 `input_tokens` **不含**命中部分，这是 Anthropic 自己的语义：
+`input_tokens + cache_read_input_tokens` 才是总输入（258 + 2560 = 2818）。
+
+三处共享同一份缓存——同一段 prompt 先用 chat 端点打过，再发到 messages 端点，第一次就命中 2560。
+
+两处与官网的差异，都是设计选择：
+
+- `cache_creation_input_tokens` 恒为 0：缓存是自动的。官网在 Anthropic 面同样把 `cache_control` 标为忽略。
+- 粒度不同：官网按"前缀单元"（请求边界 / 公共前缀 / 固定间隔）切分持久化；
+  我们按 128-token 块链做内容寻址，并保留 `keep_tokens=140` 尾部重算。上报口径一致，命中位置会有差异。
+- 流式响应即使没带 `stream_options.include_usage` 也会带上 usage：网关（new-api/one-api）只能从上游
+  usage 拿到计费与缓存数字，丢掉它会退化成网关自己分词、缓存永远算 0。
+
+工具：[`tools/cache_hit_matrix.py`](tools/cache_hit_matrix.py) 一条命令复跑上面这张表。
 
 ## 七、关键修复：Engram fetch 的隐藏开销
 

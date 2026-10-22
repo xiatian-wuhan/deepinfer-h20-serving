@@ -191,10 +191,10 @@ index 0000000..add99d6
 +raise SystemExit(1 if mismatches else 0)
 diff --git a/serve/openai_server.py b/serve/openai_server.py
 new file mode 100644
-index 0000000..d1c37b2
+index 0000000..ac87da7
 --- /dev/null
 +++ b/serve/openai_server.py
-@@ -0,0 +1,1372 @@
+@@ -0,0 +1,1376 @@
 +"""Minimal OpenAI-compatible chat server on top of the DeepInfer offline engine.
 +
 +DeepInfer ships offline inference only. This wraps one `LLM` per data-parallel rank
@@ -987,7 +987,11 @@ index 0000000..d1c37b2
 +    def prepare(self, protocol: str, body: dict) -> _Prepared:
 +        """Convert one protocol request into engine input. CPU work: call it from a thread."""
 +        payload = dict(body)
-+        payload["model"] = payload.get("model") or self.model_name
++        # DeepSeek's Anthropic surface maps Claude model names onto its own (claude-opus* -> v4-pro,
++        # claude-sonnet*/haiku* -> flash) so that pointing Claude Code at the base_url is enough. This
++        # node serves one model, so every claude* name resolves to it; other unknown names still 400.
++        requested = str(payload.get("model") or "")
++        payload["model"] = self.model_name if requested.lower().startswith("claude") else (requested or self.model_name)
 +        request_type = self.request_types[protocol][0]
 +        try:
 +            request = request_type(json.dumps(payload).encode())
