@@ -199,6 +199,26 @@ curl -s $BASE/v1/chat/completions -H 'Content-Type: application/json' -d "{
 采样参数（`temperature`/`top_p`/`top_k`/`seed`/`ignore_eos`）**从请求体原样取**，不走 recipe 的
 V4.1 默认值——非思考模式下官方会把 `top_p` 钉到 1.0，那会让调用方设的值失效。
 
+### stop / stop_sequences
+
+`stop`（chat）与 `stop_sequences`（messages）由**协议层解析，不是引擎参数**：引擎的 `SamplingParams`
+没有 `stop` 字段，所以它照常往 EOS / `max_tokens` 解码，由 Rust 解析器盯着解出的文本做截断。
+
+命中后的行为：
+
+| 项 | 值 |
+|---|---|
+| 正文 | 只到命中点之前，**不含** stop 串；命中点之后的尾巴一律不返回 |
+| 结束原因 | `stop_reason: "stop_sequence"`，并在 `message_delta.stop_sequence` 回带命中的串 |
+| `usage` | 截断在命中点，按实际交付的 token 计 |
+| 引擎侧 | 立即 abort 该序列，否则它会继续解码到 EOS，白占一个 KV slot |
+| 指标 | `/deepinfer/metrics` 的 `deepinfer:stop_sequences_total` +1，`errors_total` **不**加 |
+
+2026-10-23 之前这条路径有缺陷：解析器收尾后前端还在推 token，下一次 `push` 抛
+`RuntimeError: stream processor has finished`。非流式请求会变成纯文本 `500`，流式则因为
+`message_stop` 已经发出而表现为**静默截断**（客户端拿到半截正文却以为正常结束）。
+回归用例见 [`docker/verify_stop_sequence.py`](../docker/verify_stop_sequence.py)。
+
 ## Responses
 
 ```bash

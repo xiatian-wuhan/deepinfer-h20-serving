@@ -1019,10 +1019,10 @@ index 0000000..74ba0cf
 +raise SystemExit(1 if mismatches else 0)
 diff --git a/serve/deepseek_server.py b/serve/deepseek_server.py
 new file mode 100644
-index 0000000..7ad1ae1
+index 0000000..67e4f3b
 --- /dev/null
 +++ b/serve/deepseek_server.py
-@@ -0,0 +1,1376 @@
+@@ -0,0 +1,1401 @@
 +"""Serving front-end for the DeepInfer offline engine: Chat Completions, Responses, Messages.
 +
 +DeepInfer ships offline inference only. This wraps one `LLM` per data-parallel rank
@@ -1313,9 +1313,20 @@ index 0000000..7ad1ae1
 +    created = int(time.time())
 +    generated = 0
 +
++    stopped = False
++
 +    async def outputs():
-+        """Engine token ids in, protocol chunks out (usage included)."""
-+        nonlocal generated
++        """Engine token ids in, protocol chunks out (usage included).
++
++        Two parties can end a response. The engine does it with a `finished` item (EOS, length,
++        content filter). The parser does it too: it owns the request's `stop_sequences` - the
++        engine cannot know them, `SamplingParams` has no `stop` field - so when a stop string
++        appears it emits the closing events and completes the stream on its own. From then on
++        `push` raises `RuntimeError("stream processor has finished")`, so completion is a terminal
++        signal here, not an error. The engine keeps decoding because it never saw the stop string,
++        which is why `close` has to abort the sequence too.
++        """
++        nonlocal generated, stopped
 +        announced = False
 +        while True:
 +            item = await q.get()
@@ -1339,19 +1350,30 @@ index 0000000..7ad1ae1
 +                fe.stats["completion_tokens"] += 1
 +                for out in processor.push(dr.InferenceChunk.tokens([token_id])):
 +                    yield out
++                if processor.finished:
++                    # A client stop sequence matched: the parser has already emitted the closing
++                    # events and closed the message. Stop pulling so usage stays at what the client
++                    # received; close() aborts the engine, which is still decoding a hidden tail.
++                    stopped = True
++                    return
 +            if finished:
-+                finish = _finish_reason(reason, generated, prepared.max_tokens)
-+                for out in processor.push(dr.InferenceChunk.finish(finish)):
-+                    yield out
-+                for out in processor.finish():
-+                    yield out
++                if not processor.finished:
++                    finish = _finish_reason(reason, generated, prepared.max_tokens)
++                    for out in processor.push(dr.InferenceChunk.finish(finish)):
++                        yield out
++                    for out in processor.finish():
++                        yield out
 +                return
 +
 +    def close(aborted: bool) -> None:
-+        fe.release(rid, aborted=aborted)
++        # A stop sequence ends the response early while the engine is still decoding, so release
++        # with abort to free the slot - but it is a normal finish, not an error.
++        fe.release(rid, aborted=aborted or stopped)
 +        processor.close()
 +        if aborted:
 +            fe.stats["errors"] += 1
++        if stopped:
++            fe.stats["stop_sequences"] += 1
 +
 +    if prepared.stream:
 +
@@ -1749,7 +1771,10 @@ index 0000000..7ad1ae1
 +        self.owner: dict[str, int] = {}
 +        self.streams: dict[str, asyncio.Queue] = {}
 +        self.ready = 0
-+        self.stats = dict(requests=0, finished=0, aborted=0, errors=0, prompt_tokens=0, completion_tokens=0, encode_fallbacks=0)
++        self.stats = dict(
++            requests=0, finished=0, aborted=0, errors=0, stop_sequences=0,
++            prompt_tokens=0, completion_tokens=0, encode_fallbacks=0,
++        )
 +        self.cache_stats: dict[int, dict] = {}
 +        self.cached: dict[str, int] = {}
 +        self.req_meta: dict[str, tuple] = {}  # rid -> (stream, include_usage, prompt_len, has_image), for --log-requests
