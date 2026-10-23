@@ -15,6 +15,9 @@
 一句话：**在 ≥27B 这一档，Qwen3.6-35B-A3B 这一类的「小激活 MoE」同时赢了 prefill 和 decode**，
 原因只有一条 —— 它每 token 只读 3B 的权重。这不是调优问题，是物理。
 
+> **补记（10-23）**：10-21 发布的 **Flint（40B / 激活 2.5B，编码专用）** 官方宣称 **150 tok/s**，
+> 若成立会取代上面的冠军。但它没有第三方实测，且 vLLM 的加速 kernel 不支持 sm_121，细节见 §10。
+
 ## 1. 一条公式解释全部现象
 
 GB10：aarch64 / sm_121 / **128 GB 统一内存（可用约 121 GB）** / FP4 1 PFLOP（稀疏）/ **约 273 GB/s** / 约 140 W。
@@ -179,6 +182,40 @@ docker run --gpus all --ipc=host --net=host lmsysorg/sglang:dev-cu13-qwen38-27b-
 5. 想要更强的模型而不是更快的：单机可跑 Nemotron 3 Super 120B-A12B（70 GB，15.8/24.0 tok/s）；
    235B 要双机；753B 要 8 机（8K 输入 1,600 tok/s prefill、67 tok/s @8 并发）。
 
+## 10. 补记：Flint（2026-10-21 发布），可能是 ≥27B 的新速度冠军
+
+Recursive（田渊栋团队的 RSI 公司）10-21 开源，Apache-2.0，HF `RecursiveSI/flint`，39.8B 参数 bf16。
+
+| 项 | 值 |
+|---|---|
+| 总量 / 激活 | 40B / **2.5B**（不是 2B） |
+| 层 | 49 = 35 层滑窗（**窗口只有 513**，带 RoPE）+ 14 层全注意力（**不带位置编码**） |
+| 注意力 | GQA 32Q / 4KV，head_dim 128，per-head Q/K RMSNorm，learned attention sinks |
+| MoE | 256 专家，**sigmoid top-6 + 重归一化**，带 shared expert；第 0–1 层为 dense |
+| 上下文 | 262K（官方卡）；博客说可到 512K，建议 ≤256K |
+| 量化 | 官方只出 BF16 与 **NVFP4 GGUF（W4A16，权重-only）** |
+| 定位 | **agentic coding 专用**，不是通用模型，无视觉 |
+
+**速度**（Recursive 官方博客，[reported] 不是第三方实测）：
+**>150 tok/s，64 GB 的 GB10 机器，短上下文**；M4 Pro MacBook >125 tok/s。注意这是**没有投机解码**的数字。
+
+按带宽账核一遍：2.5B 激活 × W4A16 ≈ 1.3–1.4 GB/token → 上限约 195 tok/s，实测 150 ≈ 77% 兑现率。
+比 35B-A3B 的 56% 高一截，因为他们把 lm_head 也量化到 4 bit，并为此专门做了 kernel。
+
+**但有一个决定性的坑**——vLLM 的 PR #62938（2026-10-22 合入）写得很清楚：
+
+> Fallback: other configurations use vLLM's standard layers: TP > 1, EP, and **GPUs outside the SM100 family such as sm_120**.
+
+GB10 是 **sm_121**，不在 SM100 家族里。也就是说那套 2.7× 的加速 kernel（7 kernel/layer、PDL 链）
+**在 Spark 上会回落到标准层**。想在 Spark 上拿到 150 tok/s，走的应该是 SGLang 的
+`lmsysorg/sglang:dev-flint` 镜像（cookbook 明确列了 DGX Spark），不是 vLLM 主线。
+
+参考数字（GB200，100K 上下文，vLLM `bench forward`）：NVFP4 decode batch1 **1.78 ms/step**
+（≈485 tok/s）、batch8 5.70 ms、8K prefill 144.6 ms；对比 stock vLLM 层的 4.81 / 8.24 / 206.6 ms。
+
+**结论**：如果这台 Spark 是**写代码的机器**，Flint 现在是最优解——同样的带宽，它比 Qwen3.6-35B-A3B 少读一半权重。
+如果还要通用问答/看图/RAG，Qwen3.6-35B-A3B 仍是默认答案。两者不冲突，可以分两台。
+
 ## 附录：来源
 
 1. DevelopersIO《A new champion among partner LLMs for DGX Spark?》— 单机 35B-A3B 两版量化的同条件实测
@@ -199,3 +236,9 @@ docker run --gpus all --ipc=host --net=host lmsysorg/sglang:dev-cu13-qwen38-27b-
    <https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4>
 9. vLLM 官方 DGX Spark 部署指南（统一内存、`max-num-seqs 4`、120B 五场景实测）
    <https://vllm.ai/blog/2026-06-01-vllm-dgx-spark>
+10. Recursive《Introducing Flint》（150 tok/s / 128K 会话平均、编码榜单）
+    <https://recursive.com/updates/introducing-recursive-flint>
+11. vLLM PR #62938 [Model] Add Flint（架构细节、NVFP4 GGUF 格式、GB200 kernel 数字、sm_120 回落）
+    <https://github.com/vllm-project/vllm/pull/62938>
+12. SGLang Cookbook · Flint（`lmsysorg/sglang:dev-flint`，明确支持 DGX Spark）
+    <https://docs.sglang.io/cookbook/autoregressive/Recursive/Flint>
