@@ -443,10 +443,11 @@ GIN 时的回退路径。换开源驱动后生产走 GIN + DeepEP 原生 Engram�
 
 | 项目 | 结果 |
 |---|---|
-| 协议回归（`tools/serve_test.py`） | **26 passed, 0 failed** |
+| 协议回归（`tools/serve_test.py`） | **26 passed, 0 failed**（换服务后重跑） |
 | stop sequence 终态（`docker/verify_stop_sequence.py`，离线，无需引擎） | **6/6 通过**；改动前 2/6，4 例复现 `RuntimeError: stream processor has finished` |
-| 在线验收探针（`tools/stop_sequence_probe.py`，未修复的服务） | **2/4**：非流式 stop 请求稳定返回纯文本 `500 Internal Server Error`，流式则"看起来正常"（静默截断） |
-| 请求错误边界（`docker/verify_request_errors.py`，离线驱动 ASGI） | **7/7 通过**；改动前 **1/7**：四个入口的畸形 body 都是纯文本 500 |
+| 在线验收探针（`tools/stop_sequence_probe.py`） | 换服务前 **2/4**（非流式 stop 稳定返回纯文本 500，流式"看起来正常"）；**2026-10-23 换服务后 4/4**，其中 `cache_read_input_tokens=384` 证明解码途中 abort 不驱逐前缀页 |
+| 请求错误边界（`docker/verify_request_errors.py`，离线驱动 ASGI） | **7/7 通过**；改动前 **1/7**：四个入口的畸形 body 都是纯文本 500。线上 `{bad` 现返回 400 |
+| 换服务后计数自洽（`/deepinfer/metrics`） | `finished 10 + aborted 4 = requests 14`，`stop_sequences_total 4`，**`errors_total 0`**，`serve.log` 零 Traceback |
 | 镜像自检（`docker/verify_service.py`） | **7 项 PASS**（含 serve 层可导入、recipe 0.2.0、app factory） |
 | 协议层对表（`tools/recipe_parity.py`） | prompt 与 token ids **10/10 相同**；输出解析 5/5；控制符注入、图片占位符通过 |
 | 缓存命中矩阵（`tools/cache_hit_matrix.py`） | 同一段 2818 token 前缀，三协议都命中 **2560**，字段各按自己的规范 |
