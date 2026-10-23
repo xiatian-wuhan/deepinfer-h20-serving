@@ -445,6 +445,7 @@ GIN 时的回退路径。换开源驱动后生产走 GIN + DeepEP 原生 Engram�
 |---|---|
 | 协议回归（`tools/serve_test.py`） | **26 passed, 0 failed** |
 | stop sequence 终态（`docker/verify_stop_sequence.py`，离线，无需引擎） | **6/6 通过**；改动前 2/6，4 例复现 `RuntimeError: stream processor has finished` |
+| 在线验收探针（`tools/stop_sequence_probe.py`，未修复的服务） | **2/4**：非流式 stop 请求稳定返回纯文本 `500 Internal Server Error`，流式则"看起来正常"（静默截断） |
 | 镜像自检（`docker/verify_service.py`） | **7 项 PASS**（含 serve 层可导入、recipe 0.2.0、app factory） |
 | 协议层对表（`tools/recipe_parity.py`） | prompt 与 token ids **10/10 相同**；输出解析 5/5；控制符注入、图片占位符通过 |
 | 缓存命中矩阵（`tools/cache_hit_matrix.py`） | 同一段 2818 token 前缀，三协议都命中 **2560**，字段各按自己的规范 |

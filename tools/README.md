@@ -17,6 +17,7 @@
 | `check_encoding_parity.py` | 消息顺序：同一批请求分别走服务层与 `encoding.py`，逐 token 比对 | 容器内 |
 | `live_order_probe.py` | 活体探针：模型看到的和吐出的顺序是否一致（不依赖离线对表） | `python3 tools/live_order_probe.py` |
 | `analyze_trace.py` | 扫真实 Claude Code trace（`serve.log`）里的顺序不变量 | `python3 tools/analyze_trace.py serve.log` |
+| `stop_sequence_probe.py` | 换服务后验收：`stop_sequences` 命中必须 **200**（修复前非流式稳定返回纯文本 500）；流式只发一次 `message_stop` 且带 `stop_reason: stop_sequence`；重复请求仍有缓存命中（证明 abort 不驱逐前缀） | `python3 tools/stop_sequence_probe.py --base http://127.0.0.1:8888` |
 
 服务层脚本要在容器里跑，是因为服务只监听容器内回环：
 
