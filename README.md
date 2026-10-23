@@ -57,6 +57,7 @@ patches/        deepinfer-h20-full.patch（相对上游 e205d42 的完整改动�
                 pr*.patch（分项补丁，便于阅读）
 tools/          服务层回归/压测、协议对表、profiler、GIN/dma-buf 探针（索引见 tools/README.md）
 notes/          01–25 调查记录（索引见 notes/README.md）
+docs/           接口参考（docs/api.md）
 data/           冻结的测量结果：基准 harness 的 summary、协议/缓存测量
 manifests/      源码仓库与子模块清单
 ```
@@ -189,7 +190,9 @@ PR#99 的 NVLink Engram 取数。同机、同驱动、同一天，只切这两�
 
 ## 六、对外接口（三协议）
 
-**Base URL** `http://<host>:8888/v1` ｜ **模型名** `DeepSeek-V4.1-Flash-1017`（可用 `DEEPINFER_SERVED_MODEL_NAME` 改）
+> 逐端点的请求/响应/事件流/错误码：**[`docs/api.md`](docs/api.md)**。这一节只讲设计取向和几个坑。
+
+**Base URL** `http://<host>:8888` ｜ **模型名** `DeepSeek-V4.1-Flash-1017`（可用 `DEEPINFER_SERVED_MODEL_NAME` 改）
 
 路由：`/v1/chat/completions`、`/v1/messages`（Anthropic，另有 `/anthropic/v1/messages` 这个官网同款前缀）、
 `/v1/messages/count_tokens`、`/v1/responses`、`/v1/models`、`/health`、`/deepinfer/metrics`。
