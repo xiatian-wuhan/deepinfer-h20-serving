@@ -1019,10 +1019,10 @@ index 0000000..74ba0cf
 +raise SystemExit(1 if mismatches else 0)
 diff --git a/serve/deepseek_server.py b/serve/deepseek_server.py
 new file mode 100644
-index 0000000..67e4f3b
+index 0000000..0aa2090
 --- /dev/null
 +++ b/serve/deepseek_server.py
-@@ -0,0 +1,1401 @@
+@@ -0,0 +1,1430 @@
 +"""Serving front-end for the DeepInfer offline engine: Chat Completions, Responses, Messages.
 +
 +DeepInfer ships offline inference only. This wraps one `LLM` per data-parallel rank
@@ -1276,6 +1276,27 @@ index 0000000..67e4f3b
 +    if "length" in str(reason or "").lower() or generated >= max_tokens:
 +        return dr.InferenceFinishReason.Length
 +    return dr.InferenceFinishReason.Stop
++
++
++class _BadRequest(Exception):
++    """A client error caught before protocol conversion, rendered as the standard 400 body."""
++
++
++async def _json_body(request: Request) -> dict:
++    """Read the request body as a JSON object, or fail with a 400.
++
++    A body that does not parse raises `json.JSONDecodeError`, which no handler maps: it escapes to
++    Starlette's ServerErrorMiddleware and comes back as a plain-text `500 Internal Server Error`.
++    Not parsing - and not being a JSON object, which every endpoint here requires - is the client's
++    fault, so it becomes the same OpenAI-shaped 400 as the rest of the bad requests (docs/api.md).
++    """
++    try:
++        payload = await request.json()
++    except json.JSONDecodeError as exc:
++        raise _BadRequest(f"invalid JSON body: {exc}") from exc
++    if not isinstance(payload, dict):
++        raise _BadRequest(f"request body must be a JSON object, got {type(payload).__name__}")
++    return payload
 +
 +
 +async def recipe_response(fe: Frontend, protocol: str, body: dict):
@@ -2197,6 +2218,14 @@ index 0000000..67e4f3b
 +        fe.loop = asyncio.get_running_loop()
 +        threading.Thread(target=fe.dispatch_forever, daemon=True).start()
 +
++    @app.exception_handler(_BadRequest)
++    async def _bad_request(request: Request, exc: _BadRequest):
++        # A 4xx with the standard body, not the plain-text 500 Starlette falls back to.
++        print(f"[server] 400 {request.url.path}: {exc}", flush=True)
++        return JSONResponse(
++            {"error": {"message": str(exc), "type": "invalid_request_error"}}, status_code=400
++        )
++
 +    @app.get("/health")
 +    async def health():
 +        ok = fe.ready == fe.args.num_engines
@@ -2219,10 +2248,10 @@ index 0000000..67e4f3b
 +    @app.post("/v1/chat/completions")
 +    async def chat(request: Request):
 +        if fe.protocol_layer == "recipe":
-+            return await recipe_response(fe, "chat_completions", await request.json())
++            return await recipe_response(fe, "chat_completions", await _json_body(request))
 +        if fe.ready != fe.args.num_engines:
 +            return JSONResponse({"error": {"message": "engine loading"}}, status_code=503)
-+        body = await request.json()
++        body = await _json_body(request)
 +        try:
 +            prompt_ids, multi_modal, image_tokens = await asyncio.to_thread(fe.render_prompt, body)
 +        except Exception as exc:  # noqa: BLE001 - bad request shapes and undecodable images land here
@@ -2377,7 +2406,7 @@ index 0000000..67e4f3b
 +            return JSONResponse(
 +                {"error": {"message": "the Messages API needs --protocol-layer recipe"}}, status_code=501
 +            )
-+        return await recipe_response(fe, "messages", await request.json())
++        return await recipe_response(fe, "messages", await _json_body(request))
 +
 +    @app.post("/anthropic/v1/messages")
 +    async def anthropic_messages(request: Request):
@@ -2391,7 +2420,7 @@ index 0000000..67e4f3b
 +            return JSONResponse(
 +                {"error": {"message": "count_tokens needs --protocol-layer recipe"}}, status_code=501
 +            )
-+        return await count_tokens_response(fe, await request.json())
++        return await count_tokens_response(fe, await _json_body(request))
 +
 +    @app.post("/anthropic/v1/messages/count_tokens")
 +    async def anthropic_messages_count_tokens(request: Request):
@@ -2404,7 +2433,7 @@ index 0000000..67e4f3b
 +            return JSONResponse(
 +                {"error": {"message": "the Responses API needs --protocol-layer recipe"}}, status_code=501
 +            )
-+        return await recipe_response(fe, "responses", await request.json())
++        return await recipe_response(fe, "responses", await _json_body(request))
 +
 +    return app
 +

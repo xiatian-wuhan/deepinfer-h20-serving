@@ -323,9 +323,16 @@ export ANTHROPIC_API_KEY=x        # 随便非空，服务不校验
 | 未知模型名 | 400 | `The supported API model names are DeepSeek-V4-Pro, DeepSeek-V4.1-Flash, DeepSeek-V4.1-Flash-1017, but you passed gpt-4o.` |
 | `n > 1` | 400 | `Invalid n value (currently only n = 1 is supported)` |
 | 请求体缺字段 | 400 | `invalid messages request: invalid request body: missing field \`messages\`` |
+| 请求体不是合法 JSON | 400 | `invalid JSON body: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)` |
+| 请求体不是 JSON 对象 | 400 | `request body must be a JSON object, got list` |
 | 图片块形状不符 / 解码失败 | 400 | `image block has no data/source/url` 等 |
 | `max_tokens` 超出剩余上下文 | 400 | `prompt has N tokens > max_model_len` |
 | 引擎未就绪 | 503 | `{"error":{"message":"engine loading"}}` |
+
+2026-10-23 之前，`await request.json()` 抛的 `JSONDecodeError` 没有任何 handler 接管：FastAPI 不
+认识它，Starlette 兜底成纯文本 `500 Internal Server Error`，异常只落在 `serve.log`。现在四个入口
+统一经过 `_json_body()` + 一个 app 级 handler，非 JSON 对象也一并拦在边界上；回归用例见
+[`docker/verify_request_errors.py`](../docker/verify_request_errors.py)。
 
 ## 观测
 
