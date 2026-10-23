@@ -216,6 +216,31 @@ GB10 是 **sm_121**，不在 SM100 家族里。也就是说那套 2.7× 的加�
 **结论**：如果这台 Spark 是**写代码的机器**，Flint 现在是最优解——同样的带宽，它比 Qwen3.6-35B-A3B 少读一半权重。
 如果还要通用问答/看图/RAG，Qwen3.6-35B-A3B 仍是默认答案。两者不冲突，可以分两台。
 
+## 11. Flint vs Qwen3.6-35B-A3B：结构对照
+
+两个都是「40B 级、2.5–3B 激活、256 专家」的 MoE，但省法完全不同：**Flint 省在窗口和输出头，Qwen 省在注意力算法**。
+
+| | Flint | Qwen3.6-35B-A3B |
+|---|---|---|
+| 总 / 激活 | 39.8B / ~2.5B（**含输出头**） | 35B / ~3B |
+| 层 | 49 = 2 dense + 47 MoE | 40，全 MoE |
+| 注意力 | 35层 SWA(**513**) + 14层 full | 30层 **Gated DeltaNet（线性）** + 10层 Gated Attention |
+| Q/KV 头 | 32 / 4，hd 128 | 16 / 2，hd 256 |
+| 位置编码 | 仅 SWA 层有 RoPE，**full 层无位置编码** | 线性层靠递归状态；full 层 mRoPE（64 维，section 11/11/10） |
+| 归一化 | per-head QK RMSNorm + attention sink | QK norm + 输出门 |
+| MoE 门控 | **sigmoid top-6** + renorm + shared | **softmax top-8** + renorm + shared |
+| 词表 | 150,144 | **248,320** |
+| 上下文 | 262,144 | 262,144（YaRN → 1,010,000） |
+| MTP | **无** | **有 1 层** |
+| 多模态 | 无（纯文本） | 有（图 + 视频） |
+| 激活率 | 6.3% | 8.6% |
+
+两台机器上真正拉开差距的两点：
+
+- **输出头**。Qwen 的 248K 词表 × 2048 = 508M 参数，占 3B 激活的 17%；Flint 只有 150K 词表（307M），
+  而且**把 lm_head 也量化到 4 bit**。这是 Flint 每 token 少读约 40% 字节的一半原因。
+- **MTP**。Qwen 自带 MTP 头，投机解码白送 1.4×（76.7→108.3）；Flint 没有，150 tok/s 是裸奔的成绩。
+
 ## 附录：来源
 
 1. DevelopersIO《A new champion among partner LLMs for DGX Spark?》— 单机 35B-A3B 两版量化的同条件实测
