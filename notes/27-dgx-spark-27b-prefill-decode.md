@@ -69,13 +69,16 @@ prefill 是算力账：dense 27B 在 8K 输入下 2,635 tok/s ≈ 13% MFU。MoE 
 | Qwen3.6-35B-A3B | 2 机 TP=2 | 短 | **7,943** | lfendy |
 | 同上（NVIDIA 权重） | 2 机 TP=2 | 短 | 6,915 | 同上 |
 | Qwen3.6-35B-A3B | 1 机 | 短 | 3.5–4.5K（**折算，未实测**） | — |
+| Nemotron 3 Super 120B-A12B | 1 机 | 短→长 | 140 → 1,900（随 prompt 增长） | vLLM 官方 |
 
 三条可用结论：
 
 1. **prefill 在 ~10K 见顶，然后随长度衰减**（2,173 → 1,895 → 1,274）。120K 输入要 95 秒才出第一个 token，
    这是 Spark 上做长上下文最硬的成本。
-2. **MoE 的 prefill 是 dense 的 3 倍左右**（7.9K vs 2.6K，虽不是同机同条件，但量级可信）。
-3. **加机器对 prefill 帮助极小**：8 机只有 1.94×（NVIDIA 官方数据），而 decode 能到 4.43×。
+2. **短 prompt 区间反过来被固定开销吃掉**：vLLM 官方在 120B 上测到 prefill 从 140 tok/s（短 prompt）
+   爬到近 1,900（长 prompt）。所以「prefill tok/s」这个数**不锁死输入长度就没有意义**。
+3. **MoE 的 prefill 是 dense 的 3 倍左右**（7.9K vs 2.6K，虽不是同机同条件，但量级可信）。
+4. **加机器对 prefill 帮助极小**：8 机只有 1.94×（NVIDIA 官方数据），而 decode 能到 4.43×。
 
 ## 4. 并发
 
@@ -88,6 +91,10 @@ prefill 是算力账：dense 27B 在 8K 输入下 2,635 tok/s ≈ 13% MFU。MoE 
 **并发是被配置卡住的，不是被硬件卡住的。** darkdatter 那台机器出厂配置只能跑 4 并发（190 tok/s），
 三个 flag 同时限制（`max-running-requests`、`max-mamba-cache-size`、`cuda-graph-max-bs-decode`），
 放开后 8→16 流从 190 涨到 480。只改一个量不出效果。
+
+但「并发越高越好」也不成立：vLLM 官方在 Spark 上的建议是 `--max-num-seqs 4`，理由是超过 4 路解码后
+每 token 的带宽税会盖过连续批处理的收益、TTFT 开始劣化。两者的差别在模型规模——27B 能吃到 16 路，
+120B 在 4 路就饱和。**并发甜点随模型变，别照抄别人的数字。**
 
 ## 5. 框架矩阵（2026-10）
 
@@ -187,3 +194,5 @@ docker run --gpus all --ipc=host --net=host lmsysorg/sglang:dev-cu13-qwen38-27b-
    <https://github.com/NVIDIA/dgx-spark-playbooks>
 8. nvidia/Qwen3.6-35B-A3B-NVFP4 模型卡（DGX Spark 推荐参数）
    <https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4>
+9. vLLM 官方 DGX Spark 部署指南（统一内存、`max-num-seqs 4`、120B 五场景实测）
+   <https://vllm.ai/blog/2026-06-01-vllm-dgx-spark>
