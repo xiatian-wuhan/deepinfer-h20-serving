@@ -2,11 +2,11 @@
 
     python tools/serve_bench.py --prompt-tokens 4000 --max-tokens 128 --concurrency 1 --count 4
 """
-import argparse, json, statistics, sys, threading, time, urllib.request
+import argparse, json, os, statistics, sys, threading, time, urllib.request
 
-BASE = "http://127.0.0.1:8888"
-MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 p = argparse.ArgumentParser()
+p.add_argument("--base", default=os.environ.get("DEEPINFER_SERVE_BASE", "http://127.0.0.1:8888"))
+p.add_argument("--model", default=os.environ.get("DEEPINFER_SERVED_MODEL_NAME", "DeepSeek-V4.1-Flash-1017"))
 p.add_argument("--prompt-tokens", type=int, default=4000)
 p.add_argument("--max-tokens", type=int, default=128)
 p.add_argument("--concurrency", type=int, default=1)
@@ -21,14 +21,14 @@ lock = threading.Lock()
 
 
 def one(idx: int) -> None:
-    body = {"model": MODEL,
+    body = {"model": a.model,
             "messages": [{"role": "system", "content": "Read the document.\n\n" + doc},
                          {"role": "user", "content": f"Reply with the single word OK. ({idx})"}],
             "max_tokens": a.max_tokens, "temperature": 0, "stream": True,
             "ignore_eos": True,  # generate exactly max_tokens so TPOT/throughput are real
             **({"prefix_cache": False} if a.no_cache else {}),
             "stream_options": {"include_usage": True}}
-    req = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(body).encode(),
+    req = urllib.request.Request(a.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     t0 = time.perf_counter()
     ttft = None; ntok = 0; usage = None

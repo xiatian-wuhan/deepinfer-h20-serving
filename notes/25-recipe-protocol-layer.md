@@ -1,7 +1,7 @@
 # 25 — 协议层换成 deepseek-recipe：把"协议"还给协议框架
 
 [`notes/24`](24-message-order-vs-official-encoding.md) 的结论是"我们和官方两份实现对得上"，
-代价是**同一套规则我们维护了两份实现**（`serve/openai_server.py` 里手写的渲染/解析，
+代价是**同一套规则我们维护了两份实现**（`serve/deepseek_server.py` 里手写的渲染/解析，
 对照 `$MODEL/encoding/encoding.py`），并且已经为此付过三次修复：DSML 探测标记过严、
 流式门控漏换行、容错解析器差一。
 
@@ -34,7 +34,7 @@ prompt_ids → ③ 引擎 → 采样出的 token_ids → ④ token_ids → 各�
 - ③ 是**我们唯一的领域**：8 卡 CP8×EP8、前缀缓存、YoCo、MTP。
 
 所以边界应该划在 **token_ids**：引擎只认 token id、只吐 token id，前面全部交给协议框架。
-我们过去把 ①②④ 都写在了 `openai_server.py` 里——那不是"服务层薄"，是把两份外部规格
+我们过去把 ①②④ 都写在了 `deepseek_server.py` 里——那不是"服务层薄"，是把两份外部规格
 抄进了自己的代码，然后靠 `tools/check_encoding_parity.py` 反向验证抄得对不对。
 
 `deepseek-recipe` 正是官方为此发布的库，README 第一句就是这个分工：
@@ -131,7 +131,7 @@ prompt_ids → ③ 引擎 → 采样出的 token_ids → ④ token_ids → 各�
 ## 3. 服务层现在长什么样
 
 ```
-openai_server.py
+deepseek_server.py
 ├── worker_main           引擎侧（CP8×EP8、前缀缓存、YoCo）—— 未改
 ├── Frontend
 │   ├── submit/release    rid ↔ DP rank、缓存命中数、usage 记账 —— 未改

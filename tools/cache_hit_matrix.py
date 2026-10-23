@@ -13,11 +13,12 @@ on the same number for the same prompt.
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.request
 
-BASE = "http://127.0.0.1:8888"
-MODEL = "DeepSeek-V4.1-Flash-1017"
+BASE = os.environ.get("DEEPINFER_SERVE_BASE", "http://127.0.0.1:8888")
+MODEL = os.environ.get("DEEPINFER_SERVED_MODEL_NAME", "DeepSeek-V4.1-Flash-1017")
 NONCE = f"cache-probe-{int(time.time())}"
 
 

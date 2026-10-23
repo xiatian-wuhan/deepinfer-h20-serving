@@ -1,5 +1,10 @@
 # 18 — 1M 上下文该用哪种布局：CP8 vs DP8（实测）
 
+> **快照说明**：本文数字是 2026-10-22 在**专有内核模块 + `EP_DISABLE_GIN=1`** 下测的。
+> 换开源驱动后同一 harness 重测：1M TTFT CP8 **30.220 s** / DP8 **140.970 s**（关 GIN 时 CP8 25.274 s）。
+> 当前口径见 `README §5.1`。
+
+
 日期：2026-10-22。同机（8×H20-3e，141 GB/卡）、同 commit `63b430a`、同 env
 （`EP_DISABLE_GIN=1 DEEPINFER_ENGRAM_NVLINK_FETCH=1 DEEPINFER_USE_NEXTN_DECODE=5
 DEEPINFER_ENABLE_MTP_VARLEN=1`），Engram fetch 已按 notes/17 修好。
@@ -41,13 +46,13 @@ DEEPINFER_ENABLE_MTP_VARLEN=1`），Engram fetch 已按 notes/17 修好。
 
 - CP8 下 `max_num_seqs` 必须 ≥ 并发目标（benchmark 按每引擎在飞数自动规划；
   生产要在 serve 层显式给 `--max-num-seqs 32`）。
-- `serve/openai_server.py` 目前只透传 `--dp`（= EP size），**没有 `--cp`**，
+- `serve/deepseek_server.py` 目前只透传 `--dp`（= EP size），**没有 `--cp`**，
   要跑 CP8 必须补上（`num_engines = ep // cp`，`create_llm(cp_size=...)` 已支持）。
 - CP4×DP2 这个中间点未测，若将来并发需求上移可以补。
 
 ## serve 层已验证（CP8 端到端）
 
-`serve/openai_server.py` 已补 `--cp`：`--dp` 保持 "EP size = 用几张卡" 的语义，
+`serve/deepseek_server.py` 已补 `--cp`：`--dp` 保持 "EP size = 用几张卡" 的语义，
 引擎数 = `dp // cp`，`create_llm(cp_size=...)` 本来就支持，路由/健康检查/负载统计全部改成按引擎数。
 
 ```
@@ -67,7 +72,7 @@ serve/server.sh start --dp 8 --cp 8 --max-num-seqs 32 --port 8888
 
 ## 图片输入（OpenAI 多模态）
 
-`serve/openai_server.py` 已支持图片。契约来自模型自带的 `encoding/encoding.py`：
+`serve/deepseek_server.py` 已支持图片。契约来自模型自带的 `encoding/encoding.py`：
 `encode_messages(..., return_multi_modal_data=True)` 返回 `(prompt, {"images": records})`，
 每个图在 prompt 里落一个 `<｜deepseek_image｜>`（id 129264），引擎的
 `multi_modal_processor.overwrite_prompt` 再按 `compute_image_layout` 把它展开成

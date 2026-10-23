@@ -1,5 +1,10 @@
 # 16 — CP8 复现：布局选错，不是代码慢
 
+> **快照说明**：本文数字是 2026-10-22 在**专有内核模块 + `EP_DISABLE_GIN=1`** 下测的。
+> 换开源驱动后同一 harness 重测：CP8 128K TTFT **3.859 s**（关 GIN 时 3.342）、c=32 **1614.3**、
+> c=64 **1836.4**。当前口径见 `README §5.1`、`§5.3`。
+
+
 日期：2026-10-22。主机 <h20-host>（8×H20-3e），commit `63b430a`，
 镜像 `deepinfer-sm90:v41-sm90`，`EP_DISABLE_GIN=1 DEEPINFER_ENGRAM_NVLINK_FETCH=1
 DEEPINFER_USE_NEXTN_DECODE=5 DEEPINFER_ENABLE_MTP_VARLEN=1`，

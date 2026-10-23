@@ -49,7 +49,7 @@
 PASS  PR#195 scheduler bindings  (Scheduler.free_finished_seqs + add_prompted_sequence)
 PASS  PR#144 prefix cache        (Sequence.block_table; hicache import deferred (no GPU))
 PASS  PR#144 hicache sources     (5 files present)
-PASS  PR#147 serve layer         (serve/openai_server.py imports)
+PASS  PR#147 serve layer         (serve/deepseek_server.py imports)
 PASS  deepseek-recipe            (Anthropic)
 PASS  deepinfer-server engine pool
 PASS  serve/ app factory         (build_app)

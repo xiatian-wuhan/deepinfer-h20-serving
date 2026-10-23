@@ -1,0 +1,18 @@
+nonce = cache-probe-1792718082
+
+== chat completions ==
+  non-stream #1          prompt_tokens=2818  prompt_cache_hit_tokens=0  prompt_cache_miss_tokens=2818  prompt_tokens_details.cached_tokens=0
+  non-stream #2          prompt_tokens=2818  prompt_cache_hit_tokens=2560  prompt_cache_miss_tokens=258  prompt_tokens_details.cached_tokens=2560
+  stream (chat.completion.chunk) prompt_tokens=2818  prompt_cache_hit_tokens=2560  prompt_cache_miss_tokens=258  prompt_tokens_details.cached_tokens=2560
+
+== messages ==
+  non-stream #1          input_tokens=258  cache_read_input_tokens=2560  cache_creation_input_tokens=0
+  non-stream #2          input_tokens=258  cache_read_input_tokens=2560  cache_creation_input_tokens=0
+  stream (message_start) input_tokens=258  cache_read_input_tokens=2560  cache_creation_input_tokens=0
+  stream (message_delta) input_tokens=258  cache_read_input_tokens=2560  cache_creation_input_tokens=0
+
+== responses ==
+  non-stream #1          input_tokens=2818  input_tokens_details.cached_tokens=2560  output_tokens=1
+  non-stream #2          input_tokens=2818  input_tokens_details.cached_tokens=2560  output_tokens=1
+  stream (response.completed) input_tokens=2818  input_tokens_details.cached_tokens=2560  output_tokens=1
+

@@ -1,5 +1,10 @@
 # 性能实测（DP8×EP8，官方 harness）与参考表对比
 
+> **快照说明**：本文数字是 2026-10-22 在**专有内核模块 + `EP_DISABLE_GIN=1`** 下测的。
+> 换开源驱动、GIN 可用后同一 harness 重测（GIN 开）：DP8 128K TTFT **14.297 s**、1M **140.970 s**、
+> c=1 **223.5 tok/s**、c=32 **2605.7**、c=64 **3693.9**。当前口径见 `README §五`，原始数据在 `data/r2/`。
+
+
 窗口：2026-10-22 17:54 起（**看门狗已按用户要求关闭，恢复时机由用户决定**）
 工具：`examples/latency_benchmark.py`（仓库自带权威基准，不是自建 bench）
 环境：`EP_DISABLE_GIN=1 DEEPINFER_ENGRAM_NVLINK_FETCH=1 DEEPINFER_ENABLE_MTP_VARLEN=1`

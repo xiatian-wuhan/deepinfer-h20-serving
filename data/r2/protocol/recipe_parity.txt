@@ -1,0 +1,33 @@
+== A1/A2. prompt text and token ids ==
+[ok]   plain_multiturn                ids=21
+[ok]   single_tool                    ids=364
+[ok]   parallel_tools_reversed        ids=401
+[ok]   tool_then_text                 ids=360
+[refused] text_then_tool                 conversion refused: ConversionError
+[ok]   mid_conversation_system        ids=20
+[ok]   interleaved_images             ids=11
+[ok]   consecutive_user_messages      ids=11
+[ok]   no_system_message              ids=306
+[ok]   assistant_text_plus_calls      ids=363
+[ok]   claude_code_like               ids=419
+10/10 cases prompt- and token-identical; 1 refused by the OpenAI contract (text_then_tool)
+
+== A3. control-token spelling typed by the user ==
+         assistant control token id = 128804
+         occurrences in a naive tokenize of the prompt = 2
+         occurrences in the recipe encoding          = 1
+         (the prompt always ends with one real assistant header)
+[ok] the user's literal text is encoded as plain text
+
+== A4. image placeholder ==
+         image sources = 1
+[ok] prompt and ids match the reference (ids=11)
+
+== C. response parity (stream and non-stream) ==
+[ok] text_only        calls=0 finish=stop usage=4
+[ok] one_call         calls=1 finish=stop usage=75
+[ok] two_calls        calls=2 finish=stop usage=92
+[ok] calls_only       calls=1 finish=stop usage=72
+[ok] arg_has_newline  calls=1 finish=stop usage=52
+
+all checks passed

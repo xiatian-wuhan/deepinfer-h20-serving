@@ -826,17 +826,19 @@ index 8765cad..84453ce 100644
              num_entries_per_layer,
 diff --git a/serve/README.md b/serve/README.md
 new file mode 100644
-index 0000000..9c81d30
+index 0000000..7627004
 --- /dev/null
 +++ b/serve/README.md
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,92 @@
 +# Serving DeepInfer + host prefix cache (local additions, not part of upstream)
 +
 +## Pieces
 +
-+- `serve/openai_server.py` — OpenAI-compatible `/v1/chat/completions` (streaming, `tools`, usage) on top of the
-+  offline engine: one engine process per GPU (attention DP + MoE EP). `serve/server.sh start|stop` runs it as a
-+  process group (stop reaps the engine helpers, which otherwise keep the GPUs).
++- `serve/deepseek_server.py` — the serving front-end: `/v1/chat/completions`, `/v1/responses` and
++  `/v1/messages` (Anthropic) over the offline engine, streaming and not, with tools, images, thinking and the
++  cache split in each protocol's own usage fields. One engine process per GPU (attention DP + MoE EP);
++  `serve/server.sh start|stop` runs it as a process group (stop reaps the engine helpers, which otherwise keep
++  the GPUs).
 +- `deepinfer/hicache/` — host-memory prefix cache (SGLang HiCache style): pinned host pools organized in pages
 +  (one page = one 128-token KV block) plus SWA state slots, hash-chain index, LRU eviction, write-through at the
 +  end of every prefill, "kernel" transfers (a CUDA kernel copying pages through UVA pointers on the engine
@@ -860,9 +862,9 @@ index 0000000..9c81d30
 +
 +`--dp` is the EP size (GPUs used) and `--cp` the context-parallel size, so the node runs `dp // cp`
 +engines; `--max-num-seqs` is per engine, and with `--cp 8` there is one engine, so it bounds the whole
-+node's concurrency. On 8x H20-3e a single 1M-token request takes 20.4 s to first token at `--cp 8`
-+against 189 s at `--cp 1`, while `--cp 1` keeps ~34% more total throughput at 32 concurrent requests
-+(notes/18-cp8-for-1m.md).
++node's concurrency. On 8x H20-3e a single 1M-token request takes 30.2 s to first token at `--cp 8`
++against 141.0 s at `--cp 1`, while `--cp 1` (DP8) serves ~61% more total throughput at 32 concurrent
++requests (see the serving repository's README §5 for the current table).
 +
 +### Protocol layer
 +
@@ -922,11 +924,11 @@ index 0000000..9c81d30
 +--use-server-token-count`) needs; `prefill-any-interval` matters there, since a single lane keeps most ranks idle.
 diff --git a/serve/check_prefix_cache.py b/serve/check_prefix_cache.py
 new file mode 100644
-index 0000000..add99d6
+index 0000000..74ba0cf
 --- /dev/null
 +++ b/serve/check_prefix_cache.py
 @@ -0,0 +1,89 @@
-+"""A/B check of the host prefix cache on a running serve/openai_server.py.
++"""A/B check of the host prefix cache on a running serve/deepseek_server.py.
 +
 +Builds a multi-turn conversation with a long shared prefix, sends every turn twice (cache bypassed via
 +"prefix_cache": false, then with the cache) with greedy sampling, and compares outputs and TTFT.
@@ -1015,19 +1017,19 @@ index 0000000..add99d6
 +stats = requests.get(f"http://localhost:{args.port}/deepinfer/metrics", timeout=30).text
 +print("\n".join(line for line in stats.splitlines() if "hicache:hits" in line or "hicache:lookups" in line or "hit_rate" in line))
 +raise SystemExit(1 if mismatches else 0)
-diff --git a/serve/openai_server.py b/serve/openai_server.py
+diff --git a/serve/deepseek_server.py b/serve/deepseek_server.py
 new file mode 100644
-index 0000000..ac87da7
+index 0000000..7ad1ae1
 --- /dev/null
-+++ b/serve/openai_server.py
++++ b/serve/deepseek_server.py
 @@ -0,0 +1,1376 @@
-+"""Minimal OpenAI-compatible chat server on top of the DeepInfer offline engine.
++"""Serving front-end for the DeepInfer offline engine: Chat Completions, Responses, Messages.
 +
 +DeepInfer ships offline inference only. This wraps one `LLM` per data-parallel rank
 +(attention DP + MoE EP, same layout as examples/benchmark.py) behind a FastAPI frontend
 +so request-replay benchmarks such as InferenceX AgentX (aiperf) can drive it.
 +
-+    python serve/openai_server.py --model ~/models/DeepSeek-V4.1-Flash-1017 --dp 4 --port 8888
++    python serve/deepseek_server.py --model ~/models/DeepSeek-V4.1-Flash-1017 --dp 4 --port 8888
 +
 +Protocol layer: request conversion, prompt rendering and output parsing come from `deepseek-recipe`,
 +the official Rust implementation of DeepSeek's protocol stack (vendored in this image, `import
@@ -2399,15 +2401,15 @@ index 0000000..ac87da7
 +    main()
 diff --git a/serve/server.sh b/serve/server.sh
 new file mode 100755
-index 0000000..81a7633
+index 0000000..5efad62
 --- /dev/null
 +++ b/serve/server.sh
 @@ -0,0 +1,41 @@
 +#!/bin/bash
-+# Start/stop serve/openai_server.py as one process group, so stopping it also reaps the
++# Start/stop serve/deepseek_server.py as one process group, so stopping it also reaps the
 +# engine's helper processes (otherwise they outlive the frontend and keep the GPUs).
 +#
-+#   serve/server.sh start [openai_server.py args...]
++#   serve/server.sh start [deepseek_server.py args...]
 +#   serve/server.sh stop
 +set -euo pipefail
 +ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -2421,7 +2423,7 @@ index 0000000..81a7633
 +        [ -f "$ROOT/env.sh" ] && source "$ROOT/env.sh"  # optional local environment (venv, DEEPINFER_* vars)
 +        : "${DEEPINFER_HF_MODEL_DIR:?set DEEPINFER_HF_MODEL_DIR to the local checkpoint directory}"
 +        export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-+        setsid python -u "$ROOT/serve/openai_server.py" --model "$DEEPINFER_HF_MODEL_DIR" \
++        setsid python -u "$ROOT/serve/deepseek_server.py" --model "$DEEPINFER_HF_MODEL_DIR" \
 +            --served-model-name "${DEEPINFER_SERVED_MODEL_NAME:-DeepSeek-V4.1-Flash-1017}" "$@" > "$LOG" 2>&1 < /dev/null &
 +        echo $! > "$PIDFILE"
 +        port=8888 prev=

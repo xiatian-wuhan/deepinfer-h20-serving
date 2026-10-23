@@ -1,0 +1,141 @@
+{
+ "meta": {
+  "label": "run",
+  "args": {
+   "model_name": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+   "ep": 8,
+   "cp": 8,
+   "dp": null,
+   "suites": "single",
+   "out_dir": "/e2e-logs/r2/single-cp8-gin",
+   "label": "run",
+   "commit": null,
+   "prompt": "random",
+   "seed": 0,
+   "ttft_lengths": [
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+    262144,
+    524288,
+    1040384
+   ],
+   "ttft_warmup": 1,
+   "ttft_repeats": 3,
+   "ttft_output_len": 32,
+   "decode_input_len": 4096,
+   "decode_output_len": 1024,
+   "single_warmup": 1,
+   "single_repeats": 5,
+   "concurrency": [
+    32,
+    64
+   ],
+   "concurrency_warmup_output_len": 64,
+   "concurrency_waves": [
+    4
+   ],
+   "concurrency_repeats": 1,
+   "gsm8k_data": null,
+   "gsm8k_num_questions": 1319,
+   "gsm8k_num_shots": 8,
+   "gsm8k_shots_data": null,
+   "gsm8k_overlap_shots": false,
+   "gsm8k_max_new_tokens": 512,
+   "gsm8k_parallel": 64,
+   "gsm8k_format": "raw",
+   "max_num_batched_tokens": 32768,
+   "max_model_len": null,
+   "max_num_seqs": null,
+   "gpu_memory_utilization": 0.9,
+   "sampler_force_topk": 1024,
+   "enable_eplb": false,
+   "nextn": null,
+   "mtp_varlen": null,
+   "log_interval": 0,
+   "save_arrivals": false
+  },
+  "layout": {
+   "ep": 8,
+   "dp": 1,
+   "cp": 8,
+   "gpus": 8,
+   "nextn": 5,
+   "mtp_varlen": true,
+   "zero_overhead_scheduling": true,
+   "enforce_eager": false,
+   "max_num_batched_tokens": 32768,
+   "max_model_len": 32768,
+   "max_num_seqs": 4
+  },
+  "prompt": {
+   "prompt": "random",
+   "seed": 0,
+   "vocab_size": 127997
+  },
+  "engine_init_s": 81.0,
+  "commit": "63b430a47c276fae2a62f38053b2a0f406e17d82",
+  "env": {
+   "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+   "DEEPINFER_ACCELERATOR": "nvidia",
+   "DEEPINFER_CUDA_ARCH": "sm90",
+   "DEEPINFER_ENABLE_MTP_VARLEN": "1",
+   "DEEPINFER_ENV": "/opt/deepinfer/venv/bin/activate",
+   "DEEPINFER_EXPERT_COUNT_WINDOW_SIZE": "3",
+   "DEEPINFER_HF_MODEL_DIR": "/model",
+   "DEEPINFER_LOGGING_INTERVAL_STEP": "0",
+   "DEEPINFER_PREFILL_STORE_EXTRA_STATE": "1",
+   "DEEPINFER_REPO": "/opt/deepinfer/DeepInfer",
+   "DEEPINFER_SAMPLER_FORCE_TOPK": "1024",
+   "DEEPINFER_USE_MULTIMODAL_POOL": "1",
+   "DEEPINFER_USE_NEXTN_DECODE": "5",
+   "DEEPINFER_YOCO_PREFILL_KEEP_TOKENS": "140",
+   "DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE": "compact",
+   "DEEPINFER_ZERO_OVERHEAD_SCHEDULING": "1",
+   "NCCL_CUMEM_ENABLE": "1",
+   "NCCL_GIN_ERROR_QUERY_SEC": "432000",
+   "NCCL_IB_HCA": "mlx5_0",
+   "NCCL_NO_CACHE": "NCCL_WIN_STRIDE,NCCL_GIN_TYPE,NCCL_GIN_GDAKI_MAX_QP_RD_ATOMIC",
+   "NCCL_NVLS_ENABLE": "0",
+   "NCCL_PXN_DISABLE": "1",
+   "NCCL_VERSION": "2.28.3-1",
+   "NCCL_WIN_STRIDE": "399431958528"
+  },
+  "gpu": "NVIDIA H20-3e",
+  "torch": "2.13.0+cu132",
+  "python": "3.12.15",
+  "timing": "host perf_counter on the submitting rank; submit = immediately before LLMEngine.add_request (prompt already token ids); token arrival = return of the step()/flush_inflight_reqs() call that delivered it",
+  "finished_at": "2026-10-23T01:07:31+0000"
+ },
+ "results": {
+  "single": {
+   "measured": 5,
+   "ok": 5,
+   "decode_tok_s_median": 276.535,
+   "decode_tok_s_all": [
+    133.9,
+    251.2,
+    276.5,
+    366.0,
+    374.8
+   ],
+   "tpot_ms_median": 3.616,
+   "ttft_s_median": 0.348,
+   "accept_len_median": 4.031,
+   "draft_acceptance_median": 0.823,
+   "verify_steps_per_s_median": 65.577,
+   "verify_steps_per_s_all": [
+    74.37,
+    65.55,
+    68.66,
+    65.11,
+    65.58
+   ]
+  }
+ }
+}

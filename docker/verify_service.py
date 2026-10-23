@@ -49,11 +49,11 @@ def hicache_sources():
     return f"{len(need)} files present"
 
 def pr147():
-    spec = importlib.util.spec_from_file_location("oa_server", "/opt/deepinfer/DeepInfer/serve/openai_server.py")
+    spec = importlib.util.spec_from_file_location("oa_server", "/opt/deepinfer/DeepInfer/serve/deepseek_server.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     fns = [n for n in dir(mod) if "app" in n.lower() or "engine" in n.lower()]
-    return f"serve/openai_server.py imports, {len(fns)} app/engine symbols"
+    return f"serve/deepseek_server.py imports, {len(fns)} app/engine symbols"
 
 def recipe():
     import deepseek_recipe
@@ -67,11 +67,11 @@ def pool():
     return "engine_pool.EnginePool"
 
 def openai_api():
-    spec = importlib.util.spec_from_file_location("oa2", "/opt/deepinfer/DeepInfer/serve/openai_server.py")
+    spec = importlib.util.spec_from_file_location("oa2", "/opt/deepinfer/DeepInfer/serve/deepseek_server.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     build = getattr(mod, "build_app", None) or getattr(mod, "create_app", None)
-    assert callable(build), "no app factory in serve/openai_server.py"
+    assert callable(build), "no app factory in serve/deepseek_server.py"
     return f"app factory = {build.__name__}"
 
 print(f"torch {torch.__version__}, deepinfer {deepinfer.__file__}")

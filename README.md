@@ -1,8 +1,10 @@
 # DeepSeek-V4.1-Flash-1017 在 H20-3e 下的 DeepInfer 推理服务
 
 在 8×H20-3e 上用 [DeepInfer](https://github.com/DarkraiHL/DeepInfer) 的 SM90 分支跑 **DeepSeek-V4.1-Flash-1017**，
-叠一层 OpenAI 兼容服务（文本 + 图片），并记录布局选型、性能实测和一处引擎侧修复
-（解码吞吐 86.3 → 151.9 tok/s）。
+对外提供三套会话协议（Chat Completions / Responses / Anthropic Messages，全部支持流式、图片输入、
+思考模式和缓存命中上报），协议转换交给 DeepSeek 官方的
+[deepseek-recipe](https://github.com/deepseek-ai/deepseek-recipe)，并记录布局选型、性能实测和两处引擎侧修复
+（Engram 取表的冗余拷贝、集合通信缓冲按容量复用）。
 
 本仓库只包含**我们自己的**产物：Dockerfile、工具脚本、补丁、调查笔记。
 DeepInfer 源码不在此仓库内，用 `patches/deepinfer-h20-full.patch` 打到上游即可复现。
@@ -14,15 +16,16 @@ DeepInfer 源码不在此仓库内，用 `patches/deepinfer-h20-full.patch` 打�
 | 问题 | 结论 |
 |---|---|
 | 8 卡上该用哪种并行布局？ | **CP8×EP8**（`--ep 8 --cp 8`，DP 自动为 1） |
-| 1M 上下文能跑吗？ | 能。CP8 TTFT **20.403 s**；同一请求 DP8 要 **189.118 s** |
+| 1M 上下文能跑吗？ | 能。CP8 TTFT **30.2 s**；同一请求 DP8 要 **141.0 s**（§5.1） |
 | 1M 是显存问题吗？ | 不是。实测 KV **891 B/token**，1M ≈ **0.87 GiB/rank** |
-| 单会话解码差在哪？ | Engram fetch 的 padding/copy 冗余，已修复：CP8 **240.6–279.1 tok/s**，DP8 **151.9**（上游参考 158） |
-| 高并发谁更好？ | c=32 时 DP8 吞吐 **2380.6** vs CP8 1777.1；但只要承诺 1M 上下文就只能用 CP8 |
-| 消息顺序会不会乱？ | 不会。请求侧 prompt 与官方编码器**逐 token 相同**，跨轮前缀不变；本轮修掉一处 DSML 探测过严（[`notes/24`](notes/24-message-order-vs-official-encoding.md)） |
+| 单会话解码多少？ | CP8 中位 **276.5 tok/s**（5 次：134–375，跨度来自 MTP 接受率），DP8 223.5（§5.2） |
+| 高并发谁更好？ | c=32 DP8 **2605.7** vs CP8 1614.3（+61%）；但只要承诺 1M 就只能 CP8 |
+| GIN 要不要开？ | 生产开着。关掉（NVLink 回退）1M 预填快 16%，但专家通信一起退回 NCCL（§5.3） |
+| 消息顺序会不会乱？ | 不会。渲染/解析/流式都走官方 deepseek-recipe，与 checkpoint 自带编码器逐 token 对表 10/10（[`notes/24`](notes/24-message-order-vs-official-encoding.md)、[`notes/25`](notes/25-recipe-protocol-layer.md)） |
 | 协议转换谁来做？ | **deepseek-recipe**（官方 Rust 实现，已在镜像里）。服务只保留"token ids 进、token ids 出"，顺带拿到 `/v1/messages`、`/v1/responses`、`reasoning_content`、缓存命中字段（[`notes/25`](notes/25-recipe-protocol-layer.md)） |
 
-**建议**：1M 上下文 + 并发 ≤32 的场景选 CP8。低于 ~8 并发 CP8 全面更优；
-DP8 只在纯高吞吐（c≥32 短上下文）时领先，但它交付不了 1M。
+**建议**：承诺 1M 上下文、或并发 ≤16 时选 CP8；DP8 只在纯短上下文高吞吐（c≥32）时值得，
+它的 c=32 聚合吞吐高 61%，但 1M 预填慢 4.7 倍。
 
 ---
 
@@ -50,10 +53,11 @@ fp8 Engram 表分片后 23.4 GB/rank。
 
 ```
 docker/         单 Dockerfile（含 rdma-core 54 构建块）+ 构建脚本
-patches/        deepinfer-h20-full.patch（相对上游 e205d42 的完整改动，19 文件 +2080）
+patches/        deepinfer-h20-full.patch（相对上游 e205d42 的完整改动）
                 pr*.patch（分项补丁，便于阅读）
-tools/          e2e 窗口、服务压测/回归、profiler、GIN/dma-buf 探针
-notes/          01–24 调查记录（依赖基线、布局选型、网关排障、工具调用、消息顺序、驱动/GIN）
+tools/          服务层回归/压测、协议对表、profiler、GIN/dma-buf 探针（索引见 tools/README.md）
+notes/          01–25 调查记录（索引见 notes/README.md）
+data/           冻结的测量结果：基准 harness 的 summary、协议/缓存测量
 manifests/      源码仓库与子模块清单
 ```
 
@@ -81,6 +85,10 @@ serve/server.sh start --dp 8 --cp 8 --max-num-seqs 32 --port 8888
 `--dp` 是 EP 大小（= 用几张卡），`--cp` 是上下文并行大小，引擎数 = `dp // cp`。
 CP8 时只有一个引擎，所以 `--max-num-seqs` 直接决定整机并发上限。
 
+> 部署形态：容器里 `/opt/deepinfer/DeepInfer` 是完整 checkout（构建产物在里面），
+> 但 `serve/*.py` 是**逐文件**从本仓库挂进去的。改了文件名或新增文件，要重建容器或
+> `docker cp` 覆盖，否则容器里跑的还是旧文件——这个坑在本轮改名时踩到过。
+
 必需的环境变量：
 
 ```bash
@@ -97,67 +105,88 @@ GIN 需要**开源内核模块**（见[九、已知限制](#九已知限制)）�
 ### 3. 验证
 
 ```bash
-python3 tools/serve_test.py        # 25 项 OpenAI 协议断言
+python3 tools/serve_test.py        # 26 项协议断言
 ```
+
+更多工具（压测、缓存矩阵、协议对表、GIN 探针）见 [`tools/README.md`](tools/README.md)。
 
 ---
 
 ## 五、性能实测
 
-全部由仓库自带的 `examples/latency_benchmark.py` 跑出，同机、同 commit（`63b430a` + 本仓库补丁）、
-同环境变量。TTFT 为 1 次预热 + 3 次测量取中位数（除非另注）；解码为 1024 in / 512 out。
+全部由仓库自带的 `examples/latency_benchmark.py` 跑出。测量条件、命令和每条请求的明细都在
+[`data/README.md`](data/README.md)，下面的表由 `python3 tools/summarize_data.py data/r2`
+从冻结的 `summary.json` 生成，不是手抄的。
+
+- **CP8** = `--ep 8 --cp 8`：注意力 TP8 + 专家 EP8，8 张卡服务同一个 batch（DP 自动为 1）。
+- **DP8** = `--ep 8 --cp 1 --dp 8`：8 个独立副本，一个请求只吃一张卡的注意力。
 
 ### 5.1 首 token 延迟（TTFT）
 
 | 布局 | 128K | 1M |
 |---|---:|---:|
-| **CP8 × EP8** | **3.064 s**（3.048 / 3.064 / 3.066） | **20.403 s** |
-| DP8 × EP8 | 10.641 s（10.631 / 10.641 / 10.649） | 189.118 s |
-| 上游参考 CP8（`doc/sm90.md`） | 2.114 s | 19.41 s |
+| **CP8 × EP8** | **3.859 s**（3.843 / 3.859 / 3.914） | **30.220 s** |
+| DP8 × EP8 | 14.297 s（14.249 / 14.297 / 14.481） | 140.970 s |
 
-1M 行是单次测量（`--ttft_warmup 0`）。记录里 `output_tokens=1, finish_reason=length`
-是因为 `1M prompt + 32 输出 > max_model_len`，不是失败。
+1M 行是单次测量（`--ttft_warmup 0`）：光预填就要 30 s，预热一次太贵。
 
-> 预填在 DP8 下只有一张卡算注意力，长度上去后超线性恶化：128K→1M 涨 17.8 倍，
-> 而 CP8 只涨 6.7 倍。**这就是 1M 只有 CP8 可用的原因。**
+输入从 128K 到 1M 涨 7.9 倍，CP8 的 TTFT 涨 7.8 倍（近线性），DP8 涨 9.9 倍——
+DP8 的预填只有一张卡算注意力，长度上去后超线性恶化。**承诺 1M 上下文时只有 CP8 可用（快 4.7 倍）。**
 
-### 5.2 解码吞吐与 TPOT
+### 5.2 解码吞吐与 TPOT（4096 in / 1024 out，`ignore_eos` 生成满长度）
 
-| 并发 | CP8 × EP8 | DP8 × EP8 | 上游参考 DP8 |
-|---|---:|---:|---:|
-| 1 | **240.6–279.1 tok/s**（TPOT 3.58–4.16 ms） | 151.9 tok/s（6.58 ms） | 158（6.33 ms） |
-| 32 | 1777.1（15.25 ms，单请求 66.0） | **2380.6**（9.70 ms，单请求 103.4） | 2912（6.13 ms） |
-| 64 | 未测 | **3826.7**（11.04 ms，单请求 91.0） | 4259（8.32 ms） |
+| 并发 | CP8 总量 | CP8 单请求 | CP8 TPOT | DP8 总量 | DP8 单请求 | DP8 TPOT |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | — | **276.5** | 3.62 ms | — | 223.5 | 4.47 ms |
+| 32 | 1614.3 | 70.5 | 12.59 ms | **2605.7** | 148.8 | **6.53 ms** |
+| 64 | 1836.4 | 41.3 | 21.74 ms | **3693.9** | 109.8 | **8.70 ms** |
 
-c=32 时单请求 TTFT（1K 输入）：CP8 **2.30 s** / DP8 3.69 s。
+单会话那一行不要用一次测量代表：同一配置连测 5 次是 **134 / 251 / 277 / 366 / 375 tok/s**
+（原始记录 `data/r2/single-cp8-gin/`）。3 倍跨度来自 MTP draft 的接受长度——accept 1.80 时
+TPOT 7.47 ms、accept 5.72 时 2.67 ms，是**同一份权重的真实分布**，不是抖动。表里取中位数。
 
-### 5.3 Engram fetch 修复的收益
+并发 32/64 时的 TTFT（4K 输入）：CP8 2.22 s / 3.71 s，DP8 3.07 s / 4.94 s。
 
-| 指标 | 修复前 | 修复后 |
+### 5.3 GIN 开还是关
+
+换开源内核模块后 GIN 可用，DeepEP 走原生 GIN；显式关掉
+（`EP_DISABLE_GIN=1 DEEPINFER_ENGRAM_NVLINK_FETCH=1`）则回退到 NCCL 集合通信 +
+PR#99 的 NVLink Engram 取数。同机、同驱动、同一天，只切这两个变量：
+
+| 指标 | GIN（生产默认） | 关闭 GIN（NVLink 回退） |
 |---|---:|---:|
-| DP8 c=1 解码 | 86.3 tok/s（TPOT 11.5 ms） | **151.9**（6.58 ms） |
-| DP8 c=32 吞吐 | 1615.7 | **2380.6** |
-| DP8 c=64 吞吐 | 2770.6 | **3826.7** |
-| CP8 c=1 解码 | 199.1–231.8 | **240.6–279.1** |
-| Engram 路径（serve_bench，c=1 热态） | NVLink 回退 TPOT 6.5 ms / 153.0 tok/s | **GIN 原生 TPOT 5.6 ms / 177.9 tok/s** |
-| CP8 c=32 吞吐 | 1720.9 | **1777.1** |
+| TTFT @128K | 3.859 s | **3.342 s**（快 13%） |
+| TTFT @1M | 30.220 s | **25.274 s**（快 16%） |
+| c=1 解码，5 次中位 | **276.5** | 221.5 |
+| c=32 总吞吐 | 1614.3 | 1665.8 |
+| c=32 TPOT 中位 | 12.59 ms | 12.45 ms |
 
-DP8 c=1 达到上游参考（158 tok/s）的 **96%**，TPOT 差 4%。
+- **长上下文预填，回退路径更快**，而且离散度很小（3.328–3.373 s，三次重复）。差在 Engram
+  取表：预填一步 32K token 的取表走 GIN 是细粒度 RDMA，批量上可能不占优；回退路径用集合通信
+  一次搬完。机制未逐层 profiling（方法见 [`notes/15`](notes/15-profiler-engram-breakdown.md)），
+  但方向在两种输入长度上一致。
+- **短并发解码两者打平**：c=32 总吞吐差 3%，TPOT 差 0.14 ms。
+- **单会话那一列两组分布重叠**（GIN 134–375，NVLink 111–312），差异不足以归因到传输层——
+  真正的变量是每次请求的 MTP 接受率。
+- 关 GIN 会让 DeepEP 的专家通信一起退回 NCCL，这是"没有 GIN 时的可用路径"，不是免费开关。
+  **要极致 1M 预填可以切过去，但必须在自己负载上复测。**
+
+生产跑的是 GIN（驱动修好后的默认路径，见 [`notes/23`](notes/23-driver-swap-gin.md)）。
 
 ### 5.4 布局怎么选
 
-| 并发 | 推荐 | 理由 |
+| 场景 | 推荐 | 理由 |
 |---|---|---|
-| 1–8 | CP8 | 单会话与 TTFT 全面占优（1M 时 9.3×） |
-| 9–32 | CP8（需 1M 时）或两者接近 | CP8 吞吐略低但 TTFT 好 34% |
-| ≥32 纯短上下文 | DP8 | 聚合吞吐 +34%，但放弃 1M |
+| 并发 ≤16，或需要 1M | **CP8** | 单会话更快，1M 预填快 4.7 倍 |
+| 并发 ≥32，纯短上下文 | **DP8** | c=32 +61%、c=64 +101% 聚合吞吐 |
+| 既要 1M 又要高吞吐 | CP8 + 上游限流 | 1M 请求会把 8 张卡绑成同一个 batch |
 
-CP8 = 注意力 TP8 + 专家 EP8，8 卡服务同一 batch；DP8 = 8 个独立副本，一个请求只吃一张卡的注意力。
-详见 [`notes/16-cp8-layout.md`](notes/16-cp8-layout.md)、[`notes/18-cp8-for-1m.md`](notes/18-cp8-for-1m.md)。
+布局的依据是 [notes/16](notes/16-cp8-layout.md) 与 [notes/18](notes/18-cp8-for-1m.md)；
+注意那两篇是 10-22 的数字（专有驱动 + 关 GIN），与本节口径不同，只作推理过程的参考。
 
 ---
 
-## 六、OpenAI 接口
+## 六、对外接口（三协议）
 
 **Base URL** `http://<host>:8888/v1` ｜ **模型名** `DeepSeek-V4.1-Flash-1017`（可用 `DEEPINFER_SERVED_MODEL_NAME` 改）
 
@@ -375,12 +404,23 @@ num_tokens=24    max=32768   ← 解码每一步
 
 1. `index_select(..., out=)` 直接把行写进发送缓冲，省掉一次 3 GB 拷贝；
 2. 删掉 `masked_fill_` —— 接收侧只读拥有该行的 rank 那一片，其余槽位是死字节，**从不被读**；
-3. 缓冲改 layer-major，按层做 `all_to_all`。
+3. 缓冲改成 layer-major（`send[layer]` 连续，`out=` 才写得快），并按容量缓存复用——
+   一次引擎只用到两个容量（解码与预填），没必要每次 fetch 重开三块大缓冲。
 
-**正确性**由 `tests/distributed/test_engram_nvlink.py` 保证：以"全表 all_gather + 朴素索引"为参考实现，
-覆盖本地/远程归属、两层不同表大小、**各 rank token 数不同**三种情形，逐字节比对通过。
+**正确性**由 `tests/distributed/test_engram_nvlink.py` 保证：两卡 `torchrun` 跑，以"全表 all_gather +
+朴素索引"为参考实现，覆盖本地/远程归属、两层不同表大小、**各 rank token 数不同**、远低于容量的
+小步、以及 scaling-factor 的 gather，逐字节比对：
+
+```bash
+torchrun --nproc_per_node=2 tests/distributed/test_engram_nvlink.py
+[test] PASS (0 mismatching layer-cases)
+```
 
 **结果**：DP8 单会话 86.3 → 151.9 tok/s（上游参考的 96%），c=32 1615.7 → 2380.6。
+
+**请注意适用范围**：这条路径只在**关掉 GIN**时走（`EP_DISABLE_GIN=1` 会自动打开它），也就是没有
+GIN 时的回退路径。换开源驱动后生产走 GIN + DeepEP 原生 Engram，不经过这里；但 §5.3 的对照说明
+回退路径仍有价值——它的长上下文预填更快，探针和这个修复都得留着。
 
 一个踩过的坑：不能按"预填/解码"分阶段切换缓冲大小。DP8 各副本独立，一个副本在预填（cap=32768）
 而另一个在解码（cap=24）时 `all_gather` 形状不一致，NCCL 会永久死锁。最终用与负载无关的常量 cap。
@@ -389,15 +429,18 @@ num_tokens=24    max=32768   ← 解码每一步
 
 ## 八、测试与验证
 
+最近一轮（2026-10-23，`serve/deepseek_server.py`）：原始输出都在
+[`data/r2/protocol/`](data/r2/protocol/)。
+
 | 项目 | 结果 |
 |---|---|
 | 协议回归（`tools/serve_test.py`） | **26 passed, 0 failed** |
-| 非流式 / 流式 SSE / usage / cached_tokens | 全部通过 |
-| 前缀缓存 | 同 prompt 二次请求 `cached_tokens=3840/4019` |
+| 镜像自检（`docker/verify_service.py`） | **7 项 PASS**（含 serve 层可导入、recipe 0.2.0、app factory） |
+| 协议层对表（`tools/recipe_parity.py`） | prompt 与 token ids **10/10 相同**；输出解析 5/5；控制符注入、图片占位符通过 |
+| 缓存命中矩阵（`tools/cache_hit_matrix.py`） | 同一段 2818 token 前缀，三协议都命中 **2560**，字段各按自己的规范 |
 | 图片输入 | 单图、Anthropic 块走 `/v1/messages`、形状不符 400、URL 拒绝，全部通过 |
-| 协议层对表（`tools/recipe_parity.py`） | prompt 文本与 token ids 10/10 相同；输出解析 5/5；控制符注入、图片占位符通过 |
 | 工具调用 | 非流式/流式均返回 `tool_calls`，无 DSML 泄漏 |
-| Engram fetch 正确性（2 卡） | 3 组情形逐字节一致 |
+| Engram fetch 正确性（2 卡 torchrun） | **0 mismatching layer-cases** |
 | 图片 token 数学 | 410 个尺寸与引擎 `compute_image_layout` 比对，**0 处不一致** |
 
 ---
@@ -408,7 +451,8 @@ num_tokens=24    max=32768   ← 解码每一步
   且 `cuDeviceGetAttribute(124, DMA_BUF_SUPPORTED)=0`，NCCL 因此拒绝 GIN。
   换成 `nvidia-driver-595-server-open`（同版本，只换内核模块）后 attr 124 变 1、GIN 探针通过。
   过程与回滚见 [`notes/23`](notes/23-driver-swap-gin.md)，可行性分析见 [`notes/21`](notes/21-gin-fixability.md)。
-- **CP8 的 c=64 未测**（需求只到 32）。
+- **单会话解码的跨度是固有的**：同一配置 5 次测量 134–375 tok/s，变量是 MTP draft 的接受率
+  （accept 1.80 → 5.72），不是服务抖动；对外报数请用中位数 + 区间。
 - **多轮图文**：历史轮次的图片会被重新送、重新计费 prefill；图像段的前缀缓存命中未验证。
 - `BATCH_INVARIANT` 在 SM90 不支持（上游限制）。
 - 服务无鉴权，仅适合内网；对外暴露前需自行加网关。
@@ -423,9 +467,12 @@ cd DeepInfer && git checkout e205d42e4b28185e50ce30f6b7204cd01e59974c
 git apply /path/to/patches/deepinfer-h20-full.patch
 ```
 
-补丁内容（19 文件，+2080/−1）包含：SM90 支持、前缀缓存（PR#144）、scheduler API（PR#195）、
-OpenAI 服务层（PR#147）、NVLink Engram fetch（PR#99），以及本仓库的 Engram 优化、
-`--cp` 透传、图片输入。分项补丁见 `patches/pr*.patch`。
+补丁内容（**19 文件，+2601 / −1**）包含：SM90 支持（#92）、前缀缓存（#144）、scheduler 绑定（#195）、
+服务层（#147，`serve/deepseek_server.py`）、NVLink Engram fetch（#99），以及本仓库的 Engram 优化、
+`--cp` 透传、图片输入、模型名可配。
+
+已在干净的上游基线上 `git apply --check` 并真实应用过一次（应用后的工作树与本仓库记录一致）。
+`patches/history/` 里是按 PR 拆开的中途快照，**不要单独应用**（[说明](patches/README.md)）。
 
 ---
 
@@ -433,7 +480,7 @@ OpenAI 服务层（PR#147）、NVLink Engram fetch（PR#99），以及本仓库�
 
 - DeepInfer: <https://github.com/DarkraiHL/DeepInfer>
 - 上游方法论：`doc/sm90.md`、`doc/inference_deployment_qa.md`
-- 本仓库调查记录：`notes/01`–`notes/24`，其中
+- 本仓库调查记录：`notes/01`–`notes/25`（[索引](notes/README.md)），其中
   [`notes/17`](notes/17-engram-fetch-fix.md)（Engram 修复）与
   [`notes/18`](notes/18-cp8-for-1m.md)（1M 布局选型）、
   [`notes/19`](notes/19-cache-usage-through-gateway.md)（网关下的缓存显示排查）、

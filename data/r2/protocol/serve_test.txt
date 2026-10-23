@@ -1,0 +1,48 @@
+=== 1) /v1/models ===
+  PASS  返回 model list  [DeepSeek-V4.1-Flash-1017]
+
+=== 2) 非流式对话 ===
+  PASS  有文本输出  ['KV cache 是把 Transformer 在自回归生成中已算过的 Key/Value 向量缓存下来，避免每生成一个新 token 都重复计算历史 toke']
+  PASS  finish_reason 合法  [stop]
+  PASS  usage 三字段齐全  [{"prompt_tokens": 11, "completion_tokens": 50, "total_tokens": 61, "prompt_tokens_details": {"cached_tokens": 0}, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 11}]
+  PASS  有 prompt_tokens_details.cached_tokens（vLLM 兼容）  [{"cached_tokens": 0}]
+  用时 852 ms, usage={"prompt_tokens": 11, "completion_tokens": 50, "total_tokens": 61, "prompt_tokens_details": {"cached_tokens": 0}, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 11}
+
+=== 3) 流式对话 SSE ===
+  PASS  收到 [DONE]
+  PASS  首帧带 role=assistant  [roles=1]
+  PASS  有增量文本  [chunks=11]
+  PASS  流式也返回 usage（include_usage）  [{"prompt_tokens": 17, "completion_tokens": 9, "total_tokens": 26, "prompt_tokens_details": {"cached_tokens": 0}, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 17}]
+  PASS  流式 usage 含 cached_tokens
+  chunks=11, TTFT=420 ms, text='1 2 3 4 5'
+
+=== 4) 同一长 prompt 连发两次 -> cached_tokens 应该 > 0 ===
+  第 1 次: prompt_tokens=4043 cached_tokens=0
+  第 2 次: prompt_tokens=4043 cached_tokens=3840
+  PASS  首次请求 cached_tokens 为 0  [0]
+  PASS  第二次命中缓存 cached_tokens > 0  [3840]
+
+=== 5) /deepinfer/metrics ===
+  PASS  有 hicache 指标族  [3 条]
+  PASS  有请求计数指标
+    deepinfer_hicache:lookups{dp_rank="0"} 10
+    deepinfer_hicache:hits{dp_rank="0"} 2
+    deepinfer_hicache:hit_rate_tokens{dp_rank="0"} 0.45790603386596707
+
+=== 6) 图片输入（OpenAI image_url / Anthropic image）===
+  PASS  单图请求返回 200
+  PASS  prompt_tokens 计入图片展开的 token  [455 vs 纯文本 9]
+  PASS  Anthropic image 块可用（/v1/messages）
+  PASS  chat 端点拒绝 Anthropic image 块（严格 OpenAI schema）
+  PASS  默认拒绝外部图片 URL（SSRF 防护）
+
+=== 7) 工具调用（DSML -> OpenAI tool_calls）===
+  PASS  非流式返回 tool_calls  [1]
+  PASS  finish_reason 为 tool_calls  [tool_calls]
+  PASS  arguments 是合法 JSON 且含 command  [{'command': 'ls -la /tmp'}]
+  PASS  DSML 未泄漏到 content
+  PASS  流式返回 delta.tool_calls  [[0]]
+  PASS  流式 finish_reason 为 tool_calls  [tool_calls]
+  PASS  流式 DSML 未泄漏
+
+===== 结果: 26 passed, 0 failed =====

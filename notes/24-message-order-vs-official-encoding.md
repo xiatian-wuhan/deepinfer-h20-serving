@@ -141,7 +141,7 @@ fn add_tool_calls_open_branch(&mut self, dsml_open_marker: &[Segment<'_>]) {
 | 块在轮首（无正文） | **否** | **是** |
 | 标签间带空格 | 是（但严格解析器抛异常） → 仍漏 | 是 |
 
-### 修复（`serve/openai_server.py`）
+### 修复（`serve/deepseek_server.py`）
 
 1. **探测标记**改成 `<｜DSML｜` 本身，再要求紧跟 ` calls`；找不到就继续找下一个候选，
    避免正文里偶尔出现的标记把整段吞掉。
@@ -238,7 +238,7 @@ fn ensure_no_pending_tool_uses(…) -> Result<(), ConversionError> { …
 # 尺子自检
 docker exec di-e2e sh -c 'cd /model/encoding && python -m pytest -q test_encoding.py'
 
-# 逐 token 对表（容器内，因为要 import 部署中的 openai_server.py）
+# 逐 token 对表（容器内，因为要 import 部署中的 deepseek_server.py）
 docker cp tools/check_encoding_parity.py di-e2e:/tmp/
 docker exec di-e2e python /tmp/check_encoding_parity.py
 

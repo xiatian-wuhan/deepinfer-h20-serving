@@ -1,6 +1,6 @@
 # OpenAI 协议完备性审计（对照 vLLM）
 
-审计对象：`serve/openai_server.py`（PR#147 层）+ 权重自带 `encoding/encoding.py`（990 行）
+审计对象：`serve/deepseek_server.py`（PR#147 层）+ 权重自带 `encoding/encoding.py`（990 行）
 + 引擎 `SamplingParams` / `ve/multimodal_processor.py`
 
 ---

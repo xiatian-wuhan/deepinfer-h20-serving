@@ -2,7 +2,7 @@
 """Differential audit of message ordering against the checkpoint's own encoder.
 
 Oracle: `<model>/encoding/encoding.py` (DeepSeek-V4.1 reference encoder/decoder).
-Subject: the deployed serving layer (`serve/openai_server.py`) - the code that
+Subject: the deployed serving layer (`serve/deepseek_server.py`) - the code that
 turns an OpenAI chat request into prompt tokens and model text back into
 `tool_calls`.
 
@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 
 MODEL_DIR = Path("/model")
-SERVER_PATH = Path("/opt/deepinfer/DeepInfer/serve/openai_server.py")
+SERVER_PATH = Path("/opt/deepinfer/DeepInfer/serve/deepseek_server.py")
 
 # 1x1 PNG; enough to exercise the image path without shipping a fixture.
 PNG_1X1 = base64.b64encode(
